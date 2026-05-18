@@ -8,6 +8,7 @@ pub mod physics;
 pub mod systems;
 pub mod scene;
 pub mod render;
+pub mod bridge;
 
 // Остальные модули будут добавлены позже
 // pub mod scheduler;
@@ -15,7 +16,6 @@ pub mod render;
 // pub mod sensors;
 // pub mod events;
 // pub mod record;
-// pub mod bridge;
 // pub mod profiler;
 // pub mod validate;
 
@@ -25,3 +25,4 @@ pub use components::transform::{Position, Rotation, Velocity, AngularVelocity, F
 pub use components::physics::{RigidBody, BodyType, CollisionShape};
 pub use physics::integrator::IntegratorConfig;
 pub use systems::{apply_gravity, integrate_motion, clear_forces};
+pub use bridge::Simulation;

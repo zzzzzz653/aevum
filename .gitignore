@@ -1,19 +1,47 @@
 ```
-# Compiled and build artifacts
-*.o
-*.obj
-*.exe
-*.dll
-*.so
-*.a
-*.out
 # Dependencies
-**/target/
-# Logs and temp files
+target/
+**/node_modules/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.env
+.env.local
+.env.*
+
+# Logs
 *.log
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Rust
+Cargo.lock
+**/target/
+
+# Temporary files
 *.tmp
 *.swp
-# Editors
-.vscode/
-.idea/
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Tests
+.pytest_cache/
+.mypy_cache/
+
+# Build artifacts
+build/
+dist/
 ```
