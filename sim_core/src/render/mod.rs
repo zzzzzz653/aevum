@@ -23,16 +23,16 @@ impl Default for RenderConfig {
 }
 
 /// Главный рендерер
-pub struct Renderer {
+pub struct Renderer<'a> {
     config: RenderConfig,
     instance: Option<wgpu::Instance>,
-    surface: Option<wgpu::Surface>,
+    surface: Option<wgpu::Surface<'a>>,
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
     surface_config: Option<wgpu::SurfaceConfiguration>,
 }
 
-impl Renderer {
+impl<'a> Renderer<'a> {
     pub fn new(config: RenderConfig) -> Self {
         Self {
             config,
@@ -45,13 +45,14 @@ impl Renderer {
     }
 
     /// Инициализировать wgpu
-    pub async fn initialize(&mut self, window: &winit::window::Window) -> Result<(), wgpu::RequestDeviceError> {
+    pub async fn initialize(&mut self, window: &winit::window::Window) -> Result<(), Box<dyn std::error::Error>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
 
-        let surface = instance.create_surface(window)?;
+        let surface = instance.create_surface(window)
+            .map_err(|e| format!("Failed to create surface: {}", e))?;
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -60,14 +61,14 @@ impl Renderer {
                 force_fallback_adapter: false,
             })
             .await
-            .unwrap();
+            .ok_or("Failed to get adapter")?;
 
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("Simulation Device"),
-                    features: wgpu::Features::empty(),
-                    limits: wgpu::Limits::default(),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
                 },
                 None,
             )
@@ -93,6 +94,7 @@ impl Renderer {
             },
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
+            desired_maximum_frame_latency: 2,
         };
 
         surface.configure(&device, &config);
@@ -144,6 +146,7 @@ impl Renderer {
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
+                timestamp_writes: None,
             });
 
             // TODO: добавить отрисовку сфер здесь

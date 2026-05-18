@@ -11,7 +11,7 @@ pub fn clear_forces(world: &mut World) {
         }
         
         let forces = arch.get_component_slice_mut::<Force>();
-        for i in 0..arch.len() {
+        for i in 0..arch.len {
             forces[i].x = 0.0;
             forces[i].y = 0.0;
             forces[i].z = 0.0;

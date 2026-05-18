@@ -70,10 +70,14 @@ impl World {
         let entity_id = EntityId::new(index, generation);
         self.entity_counter += 1;
 
-        // Добавить в пустой архетип
-        let arch = self.get_or_create_archetype(ComponentMask::empty());
-        let arch_index = arch.spawn(entity_id);
-        self.entity_location.insert(entity_id.packed(), (arch.id, arch_index));
+        // Добавить в пустой архетип - нужно получить arch_index до того как отпустим borrow
+        let (arch_id, arch_index) = {
+            let arch = self.get_or_create_archetype(ComponentMask::empty());
+            let arch_index = arch.spawn(entity_id);
+            (arch.id, arch_index)
+        };
+        
+        self.entity_location.insert(entity_id.packed(), (arch_id, arch_index));
 
         entity_id
     }

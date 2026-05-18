@@ -101,7 +101,7 @@ pub fn find_collision_pairs(world: &World) -> Vec<(EntityId, EntityId)> {
         }
         
         let arch_aabbs = arch.get_component_slice::<AABB>();
-        for i in 0..arch.len() {
+        for i in 0..arch.len {
             if let Some(entity) = arch.entities.get(i) {
                 entities.push(*entity);
                 aabbs.push(arch_aabbs[i]);

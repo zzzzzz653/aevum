@@ -23,7 +23,7 @@ pub fn integrate_motion(world: &mut World, dt: f32) {
         let angular_velocities = arch.get_component_slice::<AngularVelocity>();
         let rigid_bodies = arch.get_component_slice::<RigidBody>();
         
-        for i in 0..arch.len() {
+        for i in 0..arch.len {
             let rb = &rigid_bodies[i];
             
             // Пропустить статические тела
@@ -42,13 +42,8 @@ pub fn integrate_motion(world: &mut World, dt: f32) {
             let rot = Quat::from_array([rotations[i].x, rotations[i].y, rotations[i].z, rotations[i].w]);
             
             if ang_vel.length_squared() > 0.0 {
-                let delta_rot = Quat::from_vec4(Vec3::new(
-                    ang_vel.x * dt * 0.5,
-                    ang_vel.y * dt * 0.5,
-                    ang_vel.z * dt * 0.5,
-                    0.0,
-                )) * rot;
-                let new_rot = (rot + delta_rot).normalize();
+                let delta_quat = Quat::from_axis_angle(ang_vel.normalize(), ang_vel.length() * dt);
+                let new_rot = (rot * delta_quat).normalize();
                 rotations[i].x = new_rot.x;
                 rotations[i].y = new_rot.y;
                 rotations[i].z = new_rot.z;

@@ -19,7 +19,7 @@ pub fn apply_gravity(world: &mut World, gravity: Vec3) {
         let rigid_bodies = arch.get_component_slice::<RigidBody>();
         let forces = arch.get_component_slice_mut::<Force>();
         
-        for i in 0..arch.len() {
+        for i in 0..arch.len {
             let rb = &rigid_bodies[i];
             
             // Применять только к динамическим телам
