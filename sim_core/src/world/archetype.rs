@@ -184,4 +184,23 @@ impl Archetype {
             vec.push(component);
         }
     }
+
+    /// Добавить компонент по индексу (для update_aabb)
+    pub fn add_component_by_index<T: Clone + Default + Send + Sync + 'static>(&mut self, index: usize, component: T) {
+        let type_id = TypeId::of::<T>();
+        if !self.arrays.contains_key(&type_id) {
+            let mut array: SmallVec<[T; 64]> = SmallVec::new();
+            array.resize(self.len, T::default());
+            if index < self.len {
+                array[index] = component;
+            }
+            self.arrays.insert(type_id, Box::new(array));
+        } else {
+            let array = self.arrays.get_mut(&type_id).unwrap();
+            let vec = array.as_any_mut().downcast_mut::<SmallVec<[T; 64]>>().unwrap();
+            if index < vec.len() {
+                vec[index] = component;
+            }
+        }
+    }
 }

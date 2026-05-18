@@ -77,7 +77,6 @@ impl Integrator {
         v *= self.config.linear_damping;
 
         // 2. Обновить угловую скорость: w += I^-1 * (t - w × Iw) * dt
-        let inertia_diag = Vec3::new(body.inertia[0], body.inertia[4], body.inertia[8]);
         let inv_inertia_diag = Vec3::new(body.inv_inertia[0], body.inv_inertia[4], body.inv_inertia[8]);
         
         // Упрощённая модель (диагональная инерция)

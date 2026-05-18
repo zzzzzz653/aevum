@@ -8,26 +8,39 @@ use glam::Vec3;
 
 /// Применить гравитацию ко всем динамическим телам
 pub fn apply_gravity(world: &mut World, gravity: Vec3) {
-    let mut query = Query::default().with::<RigidBody>().with::<Velocity>().with::<Force>();
+    let query = Query::default().with::<RigidBody>().with::<Velocity>().with::<Force>();
     
-    for arch in world.archetypes() {
+    for arch in world.archetypes_mut() {
         // Проверить что архетип содержит нужные компоненты
         if !query.matches_archetype(arch) {
             continue;
         }
         
-        let rigid_bodies = arch.get_component_slice::<RigidBody>();
-        let forces = arch.get_component_slice_mut::<Force>();
+        let mut updates: Vec<(usize, [f32; 3])> = Vec::new();
         
-        for i in 0..arch.len() {
-            let rb = &rigid_bodies[i];
-            
-            // Применять только к динамическим телам
-            if rb.body_type == BodyType::Dynamic && rb.mass > 0.0 {
-                let force = &mut forces[i];
-                force.x += gravity.x * rb.mass;
-                force.y += gravity.y * rb.mass;
-                force.z += gravity.z * rb.mass;
+        // Шаг 1: Собираем все данные, используя только чтение
+        {
+            let rigid_bodies = arch.get_component_slice::<RigidBody>();
+            for i in 0..arch.len {
+                let rb = &rigid_bodies[i];
+                if rb.body_type == BodyType::Dynamic && rb.mass > 0.0 {
+                    let force = [
+                        gravity.x * rb.mass,
+                        gravity.y * rb.mass,
+                        gravity.z * rb.mass,
+                    ];
+                    updates.push((i, force));
+                }
+            }
+        } // Здесь все неизменяемые ссылки освобождаются
+
+        // Шаг 2: Применяем изменения, используя только запись
+        {
+            let forces = arch.get_component_slice_mut::<Force>();
+            for (i, force) in updates {
+                forces[i].x += force[0];
+                forces[i].y += force[1];
+                forces[i].z += force[2];
             }
         }
     }
