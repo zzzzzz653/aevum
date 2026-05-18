@@ -1,0 +1,1637 @@
+﻿AEVUM — ПОЛНЫЙ ТЕХНИЧЕСКИЙ ПЛАН (v6.1 FINAL)
+======================================================================
+Проект Aevum: нейронный субстрат + эволюционная обёртка поверх Genesis.
+Все блоки самодостаточны, содержат детали реализации.
+======================================================================
+
+0. МЕТА-ИНСТРУКЦИЯ И БАЗОВЫЕ ПРИНЦИПЫ
+----------------------------------------------------------------------
+Реализуется нейронный субстрат и эволюционная обёртка поверх физического
+движка Genesis. Мир, физика, тело, суставы, мышцы, коллизии и сенсоры
+УЖЕ РЕАЛИЗОВАНЫ. Строится всё, что выше: pressures, learning rules,
+plasticity substrate, development engine, evolution engine, ecology,
+растительная экосистема.
+
+Главное правило: программируются ТОЛЬКО pressures, constraints, learning
+rules, plasticity, development, evolution и detection systems. Никаких
+готовых cognitive modules (нет PlanningModule, AttentionModule и т.п.).
+
+Главный вызов: удержать систему в «живой зоне» между хаосом и
+кристаллизацией на всех уровнях — нейронном, поведенческом, популяционном,
+морфологическом и экосистемном.
+
+Ключевые инженерные решения:
+- Sub-tick нейросети (10 нейрошагов на 1 физшаг) для совместимости dt
+- Exclusion-based Sleep Physics (тела удаляются из сцены в deep sleep)
+- Seed-based Forking для Time-Machine Debugger
+- Event-based Sparse Logging для наблюдаемости
+- Стабилизированное локальное обучение Latent Encoder
+- GPU-Resident Tensor Contract (все тензоры нейросети на GPU)
+
+Новые механики v6.1:
+- Гетерогенность нейронов (целевая сумма весов с индивидуальным bias)
+- Базовый мышечный тонус (min сигнал + learned bias)
+- Гистерезис в Global Workspace
+- Ретроспективное усиление авторства (self_token ↔ action_token)
+- DMN Interleaving (replay + симуляции)
+- Thought Noise + Random Jump в потоке мыслей
+- Экспоненциальное затухание старых мыслей
+- Экосистема растений (self-expanding energy network + fungal communication)
+
+Структура каталогов: aevum/core, aevum/embodiment, aevum/neural,
+aevum/cognitive, aevum/evolution, aevum/ecology, aevum/observability,
+aevum/experimentation, aevum/interfaces, aevum/config, aevum/utils.
+
+======================================================================
+ЧАСТЬ A: ОПЕРАЦИОННЫЙ КАРКАС (ИСПОЛНЕНИЕ)
+======================================================================
+
+A1. UNIFIED TICK SCHEDULER (ОБЯЗАТЕЛЬНО)
+----------------------------------------------------------------------
+Каждый тик симуляции разбит на фазы. Внутри фазы операции выполняются
+строго последовательно. Никаких гонок. Результаты предыдущих фаз видны
+последующим. Изменения весов, сделанные в фазе пластичности (Phase 6),
+не влияют на распространение спайков в этом же тике (используются старые
+веса).
+
+A1.1 Суб-тиковая архитектура (Sub-tick Neural Stepping)
+  - dt_physics = 0.01 с (100 Гц) — один вызов scene.step()
+  - dt_neural = 0.001 с (1000 Гц) — 10 подшагов нейросети на 1 физшаг
+  - Сенсорные данные (RGB, joint_positions, контакты) фиксируются
+    в начале физического тика и НЕ меняются внутри подшагов (zero-order hold).
+  - Моторные команды, сгенерированные на каждом подшаге, накапливаются:
+    final_force = mean(forces[0..9]) — и применяются один раз перед
+    следующим scene.step().
+  - Конфигурация: N_neural_subticks = 10 в config/genesis.yaml.
+
+Tick Pipeline (1 физический тик = 10 нейронных подшагов):
+
+Phase 0: SENSORY INPUT & ENCODING (выполняется 1 раз в начале тика)
+  0.1 Считать сырые данные сенсоров через GenesisEngineAdapter.get_sensors():
+      vision: torch.Tensor [B, 64, 64, 4] float32 (RGBA)
+      joint_pos: torch.Tensor [B, n_dofs] float32 (углы в радианах)
+      joint_vel: torch.Tensor [B, n_dofs] float32
+      contacts: list[dict] (link_id, pos, normal, force)
+      imu_acc: torch.Tensor [B, 3] или None
+      imu_gyro: torch.Tensor [B, 3] или None
+  0.2 Применить ReceptorLayer.forward():
+      vision → retina_preprocess (ON/OFF каналы, разность гауссиан)
+      joint_pos → population_code (гауссовы рецептивные поля, k=8 на DOF)
+      contacts → binary_flags [B, 4] (front/back/left/right)
+      internal → [B, 2] (energy/max, damage/max)
+      Выход: sensory_spike_probs [B, total_input_dim] float32 [0,1]
+      total_input_dim = 64 (vision) + n_dofs*8 + 4 + 2
+  0.3 Вычислить латентный вектор L_t через LatentEncoder.forward():
+      L_t [B, latent_dim] float32, стандартно latent_dim = 32
+      Внутри: bottleneck с L1-регуляризацией и шумовой injected noise.
+  0.4 Сохранить L_{t-1} в HistoryBuffer (maxlen=100 тиков).
+
+Phase 1: NEURAL DYNAMICS UPDATE (повторяется 10 раз за тик)
+  Для sub_tick в range(N_neural_subticks):
+  1.1 Извлечь спайки из SpikeQueue для времени sub_tick.
+  1.2 Инжектировать входные токи: input_current = sensory_spike_probs
+      на первом подшаге; на последующих sub_ticks сенсорный вход = 0.
+  1.3 Обновить мембранные потенциалы: batch_ops.update_membrane(V, I, dt, rest)
+    # Дополнение B25.3: стохастический резонанс
+    noise_level = base_noise (0.01) * (1 + uncertainty_pressure * 3)
+    # Бонус для "застрявших" нейронов (B25.3)
+    time_since_last_spike = current_tick - last_spike_tick
+    if time_since_last_spike > 500:
+        noise_level *= 1 + min(3.0, (time_since_last_spike - 500) / 100)
+    V += torch.randn_like(V) * noise_level * dt_neural
+
+1.4 Проверить пороги: batch_ops.check_spikes(V, threshold, refractory)
+    # Дополнение B25.5: нейромодуляция порога
+    effective_threshold = threshold * (
+        1 + 0.5 * serotonin - 0.3 * noradrenaline + 0.1 * acetylcholine
+    )
+    effective_threshold = clamp(effective_threshold, 0.7*threshold, 1.5*threshold)
+    
+    # Дополнение B25.7: энергетический барьер
+    low_energy_mask = (neuron_energy < 0.1)
+    effective_threshold[low_energy_mask] *= 3.0
+
+1.5 Для спайкнувших нейронов: сбросить V, установить refractory_counter,
+    обновить fatigue (B25.4), обновить avg_firing_rate (EMA).
+    # Дополнение B25.4
+    fatigue_level[spiked] += 1.0
+    refractory_periods[spiked] = base_refractory (5) + (fatigue_level[spiked] // 2).int()
+    
+    # Дополнение B25.7
+    neuron_energy[spiked] -= 0.001  # стоимость спайка
+    neuron_energy = clamp(neuron_energy, 0.0, 2.0)
+    
+    # Дополнение B25.3
+    last_spike_tick[spiked] = current_tick
+
+1.6 Запланировать новые спайки в SpikeQueue с задержками:
+    delay = base_delay + int(distance * time_per_unit)
+    # Дополнение B25.6: Short-Term Depression
+    # Фильтрация через release_probability происходит при доставке
+  1.7 Каждые 100 подшагов: проверить Stability Contract MAX_GLOBAL_ACTIVITY.
+
+Phase 2: MOTOR OUTPUT (последний подшаг)
+  2.1 Вычислить firing_rates моторных нейронов (среднее за окно 10 тиков).
+  2.2 MotorDecoder.decode(firing_rates) → raw_forces [B, n_dofs] float32
+      в диапазоне [-max_force, +max_force].
+  2.3 Нейронный CPG: осцилляция через взаимное ингибирование пулов
+      (левые/правые конечности). Контакт стопы → инжекция тока +2.0 в
+      соответствующий пул. Выход CPG: firing_rate за окно 10 тиков → [B, n_cpg].
+      MotorControl.forward(cpg_output, motor_output, blend=0.5) → combined
+  2.4 Motor Safety: ограничить изменение не более 10% за тик, clamp силами.
+  2.5 Базовый мышечный тонус:
+      Каждая мышца получает минимальный сигнал:
+        base_tone = 0.2 + η_tone, где η_tone ~ Uniform(0, 0.05)
+      К этому добавляется learned_bias — медленно накапливаемый через
+      STDP и Reward Modulation сглаженный сигнал (EMA, α=0.001).
+      Тонус обеспечивает:
+      - Минимальную жёсткость суставов (предотвращает collapse)
+      - Сохранение позы при отсутствии активных моторных команд
+      - Базовый уровень, от которого обучение отталкивается
+  2.6 Отправить финальные силы в Genesis: adapter.apply_actuators(body_id, forces).
+
+Phase 3: WORLD STEP
+  3.1 GenesisEngineAdapter.step_physics() → один вызов scene.step()
+  3.2 Обновить EnergySystem:
+      energy -= basal_metabolism (0.02)
+      energy -= motor_energy (0.05 * mean(|forces|))
+      energy -= neural_metabolism (0.0001 * N_neurons + 0.00001 * N_synapses
+               + 0.001 * N_spikes)
+  3.3 Обновить Plant Ecology (A20): фотосинтез, рост, сигналы.
+  3.4 Проверить условие смерти: energy ≤ 0 или damage > critical.
+
+Phase 4: PREDICTION & ERROR
+  4.1 PredictorPool.forward(L_t, motor_commands) → L_pred_{t+1} [B, latent_dim]
+      + confidence [B, 1] (обучен предсказывать exp(-error)).
+  4.2 Вычислить prediction_error = MSE(L_pred_{t+1}, L_{t+1})
+  4.3 Обновить скользящие средние: error_ema, confidence_ema, uncertainty_ema.
+  4.4 Predictive Calibration: каждые 1000 тиков сравнить avg_confidence
+      с actual_accuracy. При расхождении > 0.1 скорректировать bias
+      confidence-нейронов на ±0.01.
+  4.5 Обновить eligibility traces для TD(λ) (см. B11.1).
+
+Phase 5: PHASE MANIFOLD UPDATE
+  5.1 Вычислить все raw pressures из embodied статистики (A2.3):
+      survival_pressure = 1.0 если energy < 0.1 * max_energy, иначе 0
+      damage_pressure = damage / max_damage
+      homeostatic_pressure = |energy/max_energy - 0.7| (отклонение от нормы)
+      prediction_error_pressure = prediction_error / error_max
+      novelty_pressure = 1 - cosine_sim(L_t, ближайший прототип)
+      uncertainty_pressure = uncertainty_ema
+      criticality_pressure = |branching_ratio - 1.0|
+      entropy_pressure = max(0, entropy_floor - H_latent)
+      social_pressure = mean(communication_activity) при других агентах рядом
+  5.2 Преобразовать pressures → phase drives:
+      raw_drives = W_pressure_to_drive @ pressures_vector
+      (W = W_priors + W_adaptive, |W_adaptive| ≤ 0.2*|W_priors|)
+  5.3 Обновить phase_state через динамику:
+      drive[t+1] = drive[t] + drive_raw*(1-drive[t]) - decay*drive[t]
+                   - Σ(inhibition[i,j] * drive[j]²)
+                   + self_exc * drive[i]²*(1-drive[i])
+                   + noise
+  5.4 Применить Regulatory Latency: изменения в suppression_drive имеют
+      задержку 200 тиков, entropy_destabilization — adaptive 50-500.
+  5.5 Списать Regulatory Metabolic Cost с энергии агента.
+  5.6 Применить Destabilization Debt: если destabilization_drive был >0.7,
+      prediction_confidence *= 0.7, motor_precision *= 0.8 на 500 тиков.
+  5.7 Anti-dominance/anti-extinction (A3).
+  5.8 Вычислить neuromodulators = sigmoid(W_neuromod @ phase_state) [B, 6]:
+      dopamine, serotonin, noradrenaline, acetylcholine, cortisol, adenosine
+  5.9 Вычислить subnet_gains = sigmoid(W_subnet @ phase_state) [B, 10]:
+      0=CPG, 1=PredictorPool, 2=LatentEncoder, 3=Planning, 4=VETO,
+      5=EpisodicMemory, 6=SocialComm, 7=GlobalWorkspace, 8=MorphDreamer,
+      9=ReflexLoops
+  5.10 Обновить Ecological Latent Context:
+       ecology_context [B, 8] = EMA(resource_stats, predator_trend, climate,
+       social_density, terrain_difficulty) с τ=1000
+  5.11 Если consolidation_drive > 0.8: применить Deep Sleep Exclusion
+       (удалить тело из сцены). Если 0.5-0.8: перевести в Light Sleep
+       (оставить тело пассивным, sparse sensory polling).
+       При пробуждении: пересоздать тело и восстановить состояние
+       (set_dofs_position, set_velocity).
+
+Phase 6: PLASTICITY & STRUCTURAL ADAPTATION
+  6.1 STDP update: stdp_batched.update(weights, pre_spike_times, post_spike_times,
+      window=20, A_plus=0.005, A_minus=0.005, tau=20.0)
+      × dopamine_factor (dopamine * 2 + 0.5)
+  6.2 Hebbian update: hebbian_batched.update(weights, firing_rates, window=100,
+      baseline=0.01, eta=0.001)
+  6.3 Eligibility trace decay: traces *= 0.95
+  6.4 Если dopamine > 0.6: Reward Modulation: delta_w = lr * dopamine * traces
+  6.5 TD(λ): temporal_credit.update(values, reward, gamma=0.95, lambda=0.8)
+  6.6 Synaptic Scaling (каждые 1000 тиков):
+      Целевая сумма входящих весов для нейрона i = 1.0 + ε_i,
+      где ε_i ~ Uniform(-0.1, 0.1) зафиксировано при создании нейрона.
+      Это создаёт «индивидуальность» нейронов и предотвращает
+      формирование однородных пулов.
+  6.7 Activity Homeostasis: baseline_excitability *= 1.01 если firing_rate
+      < target_min; *= 0.99 если > target_max
+  6.8 Structural Growth (каждые 500 тиков): growth_score = EMA(corr * error)
+      > growth_threshold в течение 200 тиков → новый синапс
+  6.9 Pruning (каждые 2000 тиков): weight < 0.001 в течение 5000 тиков → удалить
+  6.10 Meta-Plasticity: effective = base / (tenure+1) × 0.1 если protected
+       × 0.01 если identity_protected
+  6.11 Identity Anchor eval (каждые 10000 тиков)
+  6.12 MAX_TOPOLOGY_GROWTH: > 100 синапсов/тик → growth заморозить
+  6.13 Timescale Separation Contract: проверка (A19)
+6.14 BCM threshold update (B25.2):
+    для каждого нейрона:
+      bcm_threshold = 0.99 * bcm_threshold + 0.01 * (firing_rate ** 2)
+    delta_w_bcm = 0.0005 * pre_activity * (post_activity - bcm_threshold_post)
+    weights += delta_w_bcm
+
+6.15 Local branching homeostasis (B25.8):
+    для каждого нейрона:
+      pre = pre_spikes_count[i]
+      post = sum(post_spikes_count[j] for j in post_synaptic)
+      local_branching = post / (pre + epsilon)
+      local_branching_ema = 0.99 * old + 0.01 * local_branching
+      
+      if local_branching_ema > 1.5:
+          # усилить тормозные связи
+          для каждого исходящего синапса:
+              if inhibitory: weight *= 1.05
+              else: weight *= 0.95
+      elif local_branching_ema < 0.5:
+          # усилить возбуждающие связи
+          для каждого исходящего синапса:
+              if excitatory: weight *= 1.05
+              else: weight *= 0.95
+
+6.16 Neuron energy metabolism (B25.7):
+    # Метаболическая поддержка важных нейронов
+    importance = saliency + prediction_error + (1 - neuron_energy)
+    allocation = softmax(importance) * 0.01 * agent.energy
+    neuron_energy += allocation
+    neuron_energy += 0.0001  # базовый метаболизм
+    neuron_energy = clamp(neuron_energy, 0.0, 2.0)
+Phase 7: MEMORY & REPLAY
+  7.1 ReplayBuffer.push(L_t, action, L_{t+1}, reward, saliency, ecology_context)
+      Размер буфера: 10000 переходов, кольцевой.
+  7.2 ONLINE Replay: каждые 10 тиков проигрывать 1 мини-батч (32 перехода)
+      с приоритетом = |pred_error| + |reward| + novelty.
+  7.3 DMN Interleaving (при consolidation_drive ∈ [0.2, 0.5]):
+      - 70% времени: replay реальных эпизодов из буфера
+      - 30% времени: counterfactual симуляции
+        (L_t + random_action → модель мира → L_simulated_{t+1})
+      Это позволяет консолидировать опыт и достраивать альтернативы.
+  7.4 SLEEP: если consolidation_drive > 0.5, войти в цикл сна:
+      - Prioritized Replay: 1000 переходов из буфера по приоритету
+      - Counterfactual Replay: 200 альтернативных действий
+      - Synaptic Downscaling: все веса × 0.95
+      - Protected Restoration: protected веса × 0.98, boost × 2.0
+      - Prototype Compression: похожие переходы → кластер
+      - Dream Exploration: добавить шум ×3, 100 случайных симуляций
+      Reality Anchoring: replay_weight = 0.3 макс. Если divergence > budget:
+      replay_confidence *= 0.5, learning на replay заморожен.
+      MAX_REPLAY_RATIO: если >90% времени на replay → принудительно проснуться.
+
+Phase 8: DEVELOPMENT & LIFECYCLE
+  8.1 Обновить age (в тиках). Стадии:
+      embryonic: 0-5000 тиков (только спонтанная активность, пластичность min)
+      juvenile: 5000-20000 тиков (пластичность ×3, motor babbling)
+      mature: 20000-100000 тиков (нормальная пластичность, meta-plasticity)
+      aging: >100000 тиков (pruning ускорен, excitability снижена)
+  8.2 Гормональные модуляторы: juvenile_factor, aging_factor умножаются
+      на learning_rates, growth_thresholds.
+  8.3 Спонтанная активность: random_spike_prob = 0.05 на embryonic,
+      0.01 на juvenile. Motor babbling: случайные моторные команды.
+  8.4 Дифференциация нейронов: тип (excitatory/inhibitory) уточняется по
+      локальному балансу excitation/inhibition. Сенсорные ближе к входу →
+      sensory bias. Моторные ближе к выходу → motor bias.
+  8.5 Morphology-Brain Co-Adaptation: если |new_body_plan - old_body_plan| >
+      shock_threshold → plasticity_window *= 2, exploration_bias += 0.3,
+      identity_anchors временно ослаблены.
+  8.6 Смерть: energy ≤ 0 или damage > critical → Phase 8.7.
+  8.7 Morphology Reproduction (G.6): взять top-3 геномов из lineage_cloud,
+      добавить developmental noise, создать 1-3 потомков.
+  8.8 Morphological Shock Phase (G.11) для потомков.
+  8.9 Catastrophic Simplicity Check (B18.12): если behavioral_entropy < 0.1
+      и novel_state_visitation < 0.05 → ecological perturbation.
+
+Phase 9: LIGHTWEIGHT OBSERVABILITY (каждый тик, фоном)
+  9.1 Event-based Sparse Logging:
+      - Записывать только факты спайков: (tick, neuron_id) в кольцевой буфер
+      - L_t записывать каждые 10 тиков или при изменении > 0.1
+      - prediction_error, saliency, phase_state — каждый тик (скаляры)
+      - Изменения синапсов: только если |delta_w| > 0.001
+  9.2 Causal Inspection: для каждого значительного изменения синапса
+      записывать причину (STDP/Hebbian/replay/pruning).
+  9.3 Emergence Detection: проверка детекторов (B18).
+  9.4 Criticality Monitor: branching_ratio, avalanche_size.
+  9.5 Latent Entropy: раз в 100 тиков, оценка H_latent.
+  9.6 Introspection Vectors обновить.
+  9.7 Computational Immune System (F11): проверить все детекторы.
+
+Phase 10: DEEP OBSERVABILITY (каждые 1000 тиков или по запросу)
+  10.1 Neural Weather Map: heatmap avg_firing_rate по нейронам.
+  10.2 Causal Flow Graph: граф влияния для последнего действия.
+  10.3 Decision Tree Replay: дерево pressures→действие с контрфактуалами.
+  10.4 Emergence Timeline: запись событий первого поведения, первого anchor.
+  10.5 Phase Manifold Visualization: траектория phase_state.
+  10.6 Attractor Topology Scanner (F2): карта бассейнов.
+  10.7 Dream Inspector (F4): проверка replay divergence.
+  10.8 Introspection API (E2): обновить кэш всех endpoint'ов.
+
+----------------------------------------------------------------------
+
+A2. PHASE MANIFOLD (НЕПРЕРЫВНАЯ ДИНАМИКА КОГНИТИВНЫХ РЕЖИМОВ)
+----------------------------------------------------------------------
+Pressures НЕ конкурируют как скаляры. Они индуцируют движение в
+непрерывном пространстве dynamical regimes (phase manifold).
+
+A2.1 Phase State Vector
+  phase_state ∈ R^10, компоненты (drives) ∈ [0,1]:
+    exploration_drive, exploitation_drive, defensive_drive,
+    consolidation_drive, social_drive, developmental_drive,
+    panic_drive, destabilization_drive, suppression_drive, recovery_drive
+
+A2.2 Фазовая динамика
+  drive[t+1] = drive[t]
+             + activation_input * (1 - drive[t])
+             - decay_rate * drive[t]
+             - Σ(inhibition[i,j] * drive[j]²)
+             + self_excitation * drive[i]² * (1 - drive[i])
+             + η * noise
+  A2.2.1 Attractor Sharpening: self_excitation term предотвращает
+    «серую кашу» всех drives на уровне 0.3-0.5.
+
+A2.3 От pressures к drives
+  drive_activation = W_pressure_to_drive @ pressures_vector
+  W = W_priors + W_adaptive, |W_adaptive[i,j]| ≤ 0.2 * |W_priors[i,j]|
+  W_priors инициализирована разумными значениями (таблица ниже).
+
+  Priors для W_priors:
+    survival_pressure ↑  → panic_drive +0.8, defensive_drive +0.5
+    damage_pressure ↑    → defensive_drive +0.7, panic_drive +0.3
+    homeostatic_pressure → exploitation_drive +0.6
+    prediction_error ↑   → exploration_drive +0.4, destabilization_drive +0.3
+    novelty_pressure ↑   → exploration_drive +0.5
+    uncertainty ↑        → exploration_drive +0.3, defensive_drive +0.2
+    criticality > 1.2    → suppression_drive +0.8
+    criticality < 0.8    → exploration_drive +0.4
+    latent_entropy ↓     → destabilization_drive +0.7, exploration_drive +0.3
+    social_pressure ↑    → social_drive +0.6
+    energy < sleep_thr   → consolidation_drive +0.8, exploration_drive -0.3
+    morphology_changed   → developmental_drive +0.7
+
+A2.4 От phase_state к параметрам
+  neuromodulators = sigmoid(W_neuromod @ phase_state)  # 6 нейромодуляторов
+  subnet_gains = sigmoid(W_subnet @ phase_state)        # 10 подсетей
+  temporal_horizon = base * (1 + exploration - panic)
+  learning_rate_mod = 1 + 2*developmental + exploration - suppression
+
+A2.5 Sleep as Continuous Drive
+  consolidation_drive ∈ [0,1] непрерывно. Карта уровней:
+  0-0.2: Awake (полный доступ к сенсорам/моторам)
+  0.2-0.5: Drowsy/DMN (снижена моторика, DMN Interleaving 70/30)
+  0.5-0.8: Light Sleep (пассивное тело, sparse sensing)
+  0.8-1.0: Deep Sleep (тело удалено из симуляции, massive replay)
+
+A2.6 Asynchronous Local Sleep
+  Каждый агент спит сам. НЕТ глобального sleep scheduler.
+  A2.6.1 Sleep Fidelity Scaling:
+    | Уровень     | Физика          | Сенсоры        | Replay      | CPU cost |
+    | Awake       | полная          | полные         | online only | 100%     |
+    | Drowsy/DMN  | полная          | полные         | 70/30 mix   | 90%      |
+    | Light Sleep | упрощённая      | sparse (1/10)  | medium      | 50%      |
+    | Deep Sleep  | тело удалено    | polling (1/50) | massive     | 15%      |
+  A2.6.2 Sleep Physics Policy:
+    Deep Sleep: тело удаляется (scene.remove_entity), состояние сохраняется
+    (qpos, qvel, позиция). При пробуждении: тело пересоздаётся,
+    телепортируется в сохранённое состояние.
+    Light Sleep: тело пассивно в сцене, моторы выключены.
+
+A2.7 Regulatory Latency (АНТИ-OSCILLATION)
+  Регуляторы имеют задержку:
+    criticality_suppression: 200 тиков
+    entropy_destabilization: adaptive 50-500
+    anti_dominance: 1000
+    anti_extinction: 2000
+    phase_diversity_noise: 500
+  Latency предотвращает regulator wars.
+
+A2.8 Regulatory Metabolic Cost
+  destabilization event: 2.0 energy
+  criticality suppression: 0.5/тик
+  entropy injection: 1.0/event
+  anti-dominance noise: 0.1/тик
+  phase transition: 3.0/transition
+  Регуляция не бесплатна.
+
+A2.9 Destabilization Debt (АНТИ-НАРКОТИК)
+  После destabilization_drive > 0.7:
+  - prediction_confidence *= 0.7 (на 500 тиков)
+  - motor_precision *= 0.8
+  - replay_cost *= 2.0
+  - learning_rate на реальных данных *= 0.5
+  Debt спадает с τ_recover = 500 тиков.
+
+----------------------------------------------------------------------
+
+A3. АДАПТИВНАЯ БАЛАНСИРОВКА ФАЗ
+----------------------------------------------------------------------
+A3.1 Anti-Dominance: если drive доминирует > 0.7 дольше 2000 тиков,
+  его decay_rate увеличивается, inhibition от других снижается.
+A3.2 Anti-Extinction: если drive < 0.05 дольше 5000 тиков,
+  baseline_activation повышается.
+A3.3 Phase Diversity: если только 1-2 drives активны > 5000 тиков,
+  добавляется noise во все drives.
+
+----------------------------------------------------------------------
+
+A4. PREDICTION SUBSTRATE SPECIFICATION
+----------------------------------------------------------------------
+PredictorPool: выделенный пул нейронов (64 нейрона).
+Вход: L_t [B, 32] + motor_efference_copy [B, n_dofs] → конкатенация [B, 32+n_dofs]
+  → кодируется в токи → recurrent dynamics → активность декодируется в
+  L_pred_{t+1} [B, 32] и confidence [B, 1] (обучен предсказывать exp(-error)).
+Обучение: STDP по ошибке MSE(L_pred, L_actual).
+Калибровка: каждые 1000 тиков сравнение confidence vs accuracy, коррекция bias.
+
+----------------------------------------------------------------------
+
+A5. SALIENCY SPECIFICATION (ФОРМАЛЬНО)
+----------------------------------------------------------------------
+raw_saliency = w_n*novelty_i + w_e*pred_error_i + w_h*homeo_deviation_i + w_d*damage_i
+Нормализация [0,1]. Top-K=8 проходят полностью, остальные ×0.2.
+Lateral inhibition: подавление соседей. Temporal persistence: EMA с α=0.8.
+
+Гистерезис фокуса (для Global Workspace, Roadmap 5.1):
+  - Уже активный слот имеет коэффициент удержания 0.8
+    (его saliency умножается на 1.25 для сравнения с новыми кандидатами)
+  - Новый кандидат имеет коэффициент 1.0
+  - Чтобы вытеснить текущий процесс из фокуса, новый должен превысить
+    его effective_saliency = saliency * retention_coefficient
+
+----------------------------------------------------------------------
+
+A6. IDENTITY ANCHORS (ФОРМАЛЬНО)
+----------------------------------------------------------------------
+Детекция: группы нейронов с cosine_similarity > 0.9 на T_anchor=10000 тиков.
+Требуется значимость: влияние на действия или предсказания.
+Защита: пластичность ×0.01, pruning только при катастрофическом падении.
+Пересмотр при смене среды (медленно, с гистерезисом).
+
+A6.4 Ретроспективное усиление «Я» (Retrospective Agency Attribution)
+  После выполнения действия:
+  - Если self_error (predicted_self_state vs actual_self_state) < 0.1:
+    связь self_token ↔ action_token усиливается через eligibility trace
+    с коэффициентом 0.2 (Δw = 0.2 * eligibility * (1 - self_error))
+  - Если self_error > 0.3: усиления не происходит
+    (действие вышло из-под контроля, не «моё»)
+  
+  Это создаёт накопление «авторства» над успешными действиями.
+  Действия с низкой ошибкой предсказания своего состояния
+  маркируются как «мои» и формируют основу self-model.
+
+----------------------------------------------------------------------
+
+A7. CAUSAL PRESSURE (С БЮДЖЕТОМ)
+----------------------------------------------------------------------
+Sparse intervention tracking: p_intervene = 0.01, бюджет: 10/тик.
+Приоритет: синапсы с высоким prediction_error и низким causal_confidence.
+Confound Suppression: causal_confidence < 0.3 → penalty к росту.
+
+----------------------------------------------------------------------
+
+A8. STRUCTURAL GROWTH CONSTRAINTS
+----------------------------------------------------------------------
+Условия: correlation > corr_threshold И prediction_error > err_threshold,
+держатся > T_growth=200 тиков (growth eligibility trace).
+Regional Caps: max D_max нейронов в кубе R.
+Motif Reuse: preference к усилению существующих мотивов.
+Growth Cost: energy списывается за каждый новый синапс/нейрон.
+
+A8.1 GROWTH ELIGIBILITY TRACE
+  growth_score[i,j] = EMA(correlation[i,j] * prediction_error[i,j]) с α=0.01.
+  Новый синапс: growth_score > 0.05 в течение 200 тиков И distance_cost < budget.
+
+----------------------------------------------------------------------
+
+A9. COMMUNICATION GROUNDING
+----------------------------------------------------------------------
+Proto-token Emergence: кластеризация латентных состояний (k-means, K=128).
+Bandwidth: B бит/тик. Noise: p_noise=0.01. Cost: 0.01 energy/бит.
+Trust Weighting: вес токена модулируется историей подтверждений.
+Deception: если signal выгоден отправителю, вреден получателю → trust decay.
+
+----------------------------------------------------------------------
+
+A10. SLEEP & REPLAY CONTROL
+----------------------------------------------------------------------
+Запуск: consolidation_drive > 0.5.
+Бюджет: R_max=5000 переходов за ночь.
+Приоритет: |pred_error| + |reward| + novelty.
+Операции: Prioritized, Counterfactual, Downscaling (×0.95),
+Protected Restoration (×0.98), Prototype Compression, Dream Exploration (noise×3).
+
+A10.1 DMN Interleaving (Replay-Simulation Mix)
+  При consolidation_drive ∈ [0.2, 0.5] (Drowsy/DMN режим):
+  - 70% времени: replay реальных эпизодов из буфера
+    (по приоритету = |pred_error| + |reward| + novelty)
+  - 30% времени: counterfactual симуляции (мысленные эксперименты)
+    Генерация: L_t + random_action → модель мира → L_simulated_{t+1}
+  
+  Это позволяет:
+  - Консолидировать реальный опыт
+  - Достраивать альтернативные варианты действий
+  - Исследовать «а что, если бы?» без физических последствий
+  - Улучшать модель мира на границах известного
+
+Reality Anchoring Ratio (B17.1): replay_weight = max 0.3.
+Anti-rumination: повтор эпизода → priority затухает.
+
+----------------------------------------------------------------------
+
+A11. DEVELOPMENT STATE MACHINE (ФОРМАЛЬНО)
+----------------------------------------------------------------------
+| Стадия        | Характеристики                              | Переход                  |
+|---------------|----------------------------------------------|--------------------------|
+| Эмбриональная | Спонтанная активность, пластичность min       | > 5000 тиков             |
+| Ювенильная    | Пластичность ×3, babbling, критические периоды| > 20000 тиков и error < 0.1 |
+| Зрелая        | Нормальная пластичность, meta-plasticity     | > 100000 тиков           |
+| Старение      | Pruning ускорен, excitability снижена         | —                        |
+| Смерть        | energy == 0 или damage > critical             | в любой момент           |
+
+Гормональные модуляторы: juvenile_factor, aging_factor → learning_rates, growth.
+Спонтанная активность: random_spike_prob на ранних стадиях.
+Дифференциация: тип нейрона по балансу excitation/inhibition.
+Morphology-Brain Co-Adaptation (G.11).
+
+----------------------------------------------------------------------
+
+A12. RESOURCE ECONOMY CONSTRAINTS (ЧИСЛА)
+----------------------------------------------------------------------
+Neural Budgets:
+  Max neurons: 2000 (начальный) → 5000 (эволюционный)
+  Max synapses: 100000
+  Max replay buffer: 10000 transitions
+  Max interventions/tick: 10
+  Max spikes/tick (global per agent): 50000
+  CPU time per agent per tick: цель 5 ms, жёсткий лимит 10 ms
+
+Energy Costs (в условных единицах):
+  1 spike: 0.001
+  1 neuron existence/tick: 0.0001
+  1 synapse existence/tick: 0.00001
+  1 synapse creation: 1.0 + прогрессивный налог
+  1 neuron creation: 5.0 + прогрессивный налог
+  1 replay event: 0.1
+  1 motor activation (средней силы): 0.05
+  1 brain simulation step: 0.1 * depth
+  Базальный метаболизм/tick: 0.02
+  Регуляторные события: see A2.8
+
+----------------------------------------------------------------------
+
+A13. STABILITY CONTRACTS
+----------------------------------------------------------------------
+- MAX_GLOBAL_ACTIVITY: avg_firing_rate > 100 Гц → refractory ↑, excitability ↓10%
+- MAX_TOPOLOGY_GROWTH: > 100 синапсов/тик → growth отключить
+- MAX_REPLAY_RATIO: > 90% времени на replay → проснуться
+- MAX_CAUSAL_MEMORY: intervention_history ≤ 1000 записей
+- NO_NAN_CONTRACT: любой NaN → аварийная остановка
+- MAX_COORDINATE_CONTRACT: объект за пределами → сброс
+- ENERGY_BOUNDED_CONTRACT: energy ≥ 0
+- MAX_LOCAL_BRANCHING: если local_branching_ema > 2.0 для любого нейрона
+  дольше 1000 тиков → принудительный сброс его весов к нулю (reset)
+----------------------------------------------------------------------
+
+A14. ECOLOGY STABILITY CONTRACTS
+----------------------------------------------------------------------
+MIN_RESOURCE_AVAILABILITY, MIN_POPULATION_DIVERSITY (≥0.2),
+MAX_ENVIRONMENT_CHANGE_RATE, ECOLOGICAL_ENTROPY_FLOOR, MIN_INFORMATION_FLOW.
+
+A14.1 CIRCADIAN PRESSURE FIELD
+  light_level(t) ∈ [0,1], temperature(t), predator_activity(t),
+  resource_visibility(t). consolidation_drive модулируется.
+
+----------------------------------------------------------------------
+
+A15. ГЛАВНЫЙ ЦИКЛ
+----------------------------------------------------------------------
+ЦИКЛ ЖИЗНИ АГЕНТА (подробно в A1).
+ЦИКЛ ЭКОЛОГИЧЕСКОГО CURRICULUM: static_food → strategy_collapse → moving_food → ...
+
+----------------------------------------------------------------------
+
+A16. SENSORY-MOTOR INTERFACE (РЕЦЕПТОРНЫЙ СЛОЙ)
+----------------------------------------------------------------------
+Код в aevum/embodiment/sensory/receptor_layer.py, aevum/embodiment/motor/.
+
+A16.1 Sensory Canonicalization
+  Зрение: [B,64,64,4] → grayscale [B,64,64] → Retina Preprocess:
+    ON-канал = max(0, frame[t] - frame[t-1])
+    OFF-канал = max(0, frame[t-1] - frame[t])
+    Края = DoG (σ1=1, σ2=3)
+    Конкатенация → [B,64,64,3] → AdaptiveAvgPool2d(8,8) → flatten → [B,192]
+    Линейный слой 192→64 финальный.
+  Проприоцепция: [B,n_dofs] → каждая DOF кодируется 8 гауссовыми
+    рецептивными полями (μ равномерно по range, σ=0.1) → [B,n_dofs*8].
+  Контакты: [B,4] (порог силы = 0.1 для бинаризации).
+  Внутреннее: [B,2] (energy/max, damage/max).
+  Выход: [B, total_input_dim], total_input_dim = 64 + n_dofs*8 + 4 + 2.
+
+A16.2 Motor Decoding
+  firing_rates [B, n_dofs] за окно 10 тиков → [0, max_rate]
+  → масштабирование: [0,1] → [-max_force, +max_force].
+
+A16.3 Нейронный CPG
+  Пул CPG: 4 нейрона (2 пары L/R). Inhibitory connections w = -1.0.
+  Tonic excitatory input = 0.5. Контакт → +2.0 инжекция.
+  Выход: firing_rate за 10 тиков. НИКАКИХ sin().
+
+----------------------------------------------------------------------
+
+A17. ECOLOGICAL LATENT CONTEXT (ECOLOGICAL MEMORY FIELD)
+----------------------------------------------------------------------
+ecology_context_tensor [B, 8] float32.
+Компоненты: resource_density, resource_type_entropy, predator_activity_trend,
+  climate_temperature, light_level, social_density, terrain_roughness,
+  recent_extinction_rate.
+Обновление: EMA с τ = 1000 тиков.
+Контекст модулирует replay priority, habit bonus, attractor selection.
+
+----------------------------------------------------------------------
+
+A18. INFLUENCE BUDGET MATRIX
+----------------------------------------------------------------------
+Матрица влияния между drives (10×10), значения ∈ [min, max].
+Timescale Separation: pressure→drive max 0.5, drive→neuromod max 0.3,
+replay→struct max 0.1, struct→evolution max 0.05.
+Latency: pressure→drive 10 тиков, drive→neuromod 50, replay→struct 500.
+Anti-Resonance Detector: oscillation period < 2*latency → attenuation.
+
+----------------------------------------------------------------------
+
+A19. TIMESCALE SEPARATION CONTRACT
+----------------------------------------------------------------------
+Иерархия: ms (spikes), sec (STDP/eligibility), min (replay), hours (structural),
+  days (developmental), generations (evolution).
+Контракт: слой N может влиять на N+1 только через evidence persistence > T_evidence.
+Прямая модификация N→N+2 запрещена (clipping в 0 + warning).
+
+----------------------------------------------------------------------
+
+A20. PLANT ECOLOGY SUBSYSTEM (РАСТИТЕЛЬНАЯ ЭКОСИСТЕМА)
+----------------------------------------------------------------------
+Базовый принцип: растение — не объект, а self-expanding energy network.
+Растения образуют отдельный тип жизни с другой динамикой времени,
+стратегией выживания и формой распределённого интеллекта.
+
+A20.1 Три слоя растения
+
+  A. STRUCTURE LAYER (жёсткий каркас)
+    - Ветви, стебли, ствол — rigid bodies в Genesis
+    - Функция: удержание листвы, подъём к свету, защита от collapse
+    - Параметры: structural_integrity, max_supported_leaf_mass,
+      wood_density, growth_rate
+    - Ограничение: max_supported_leaf_mass ∝ structural_integrity
+
+  B. LEAF LAYER (энергосбор)
+    - НЕ rigid bodies — параметрические поверхности
+    - Параметры: leaf_area, leaf_density, light_efficiency,
+      photosynthesis_rate, damage_state
+    - Самозатенение: effective_leaf_area ≤ total_leaf_area
+      (перекрывающиеся листья снижают эффективность)
+
+  C. ROOT LAYER (сбор воды/минералов)
+    - Параметры: root_depth, root_spread, water_absorption_rate,
+      nutrient_efficiency
+
+A20.2 Energy Economy
+
+  Днём (light_level > 0):
+    energy_gain = light_level
+                * effective_leaf_area
+                * photosynthesis_efficiency
+                * temperature_factor
+
+  Ночью (light_level = 0):
+    energy_gain = 0
+    energy_consumption = maintenance_cost (базальный метаболизм)
+
+  maintenance_cost ∝ total_biomass (структура + листья + корни)
+  transport_cost ∝ height (доставка воды от корней к кроне)
+
+A20.3 Light Competition (главный pressure)
+
+  - Растения конкурируют за свет через вертикальный рост
+  - Высокие растения затеняют низкие
+  - Самозатенение ограничивает бесконечное расширение кроны
+  - Эмерджентные ярусы: canopy → understory → forest floor
+
+A20.4 Growth Buds (распределённый рост)
+
+  Растение имеет growth_nodes — активные точки роста.
+  Каждый bud принимает локальные решения на основе градиентов:
+
+  | Условие                 | Решение бутона                       |
+  |-------------------------|--------------------------------------|
+  | light_gradient ↑ вверх  | vertical_growth_bias ↑               |
+  | water_deficit ↑         | root_growth_bias ↑                   |
+  | structural_stress ↑     | wood_thickness ↑ (укрепление)        |
+  | free_light_pocket рядом | lateral_branch → туда                |
+  | энергия избыточна       | новый leaf_cluster / reproductive bud|
+
+  Рост НЕ централизован. Каждый bud автономен.
+
+A20.5 Fungal Communication Network (распределённая сигнальная сеть)
+
+  Каждое растение может излучать сигналы в радиусе fungal_radius:
+
+  Типы сигналов:
+    stress_signal:     "я в стрессе" (засуха, болезнь)
+    water_signal:      "здесь есть вода"
+    light_signal:      "здесь хороший свет" / "здесь тень"
+    danger_signal:     "повреждение/пожар"
+
+  Характеристики сигналов:
+  - Noisy: добавляется гауссов шум (σ = 0.2 * signal_intensity)
+  - Delayed: задержка ∝ distance (1 тик на 0.1 единицы расстояния)
+  - Local: ограничены fungal_radius
+  - Low bandwidth: 1 сигнал в 10-50 тиков
+  - Costly: signal_cost = radius² * intensity * 0.001 energy
+
+  Получатель интерпретирует сигнал как pressure modulation:
+  - received_water_stress ↑ → root_growth_bias ↑
+  - received_shade_signal ↑ → vertical_growth_bias ↑
+
+  ВАЖНО: сигналы — НЕ команды. Это pressure modulation.
+  Растение само решает, как реагировать.
+
+A20.6 Эволюция грибной сети
+
+  Мутируют:
+  - fungal_radius: [0.1, 5.0]
+  - signal_types: какие сигналы излучать/принимать
+  - signal_cost_efficiency: сколько энергии на единицу радиуса
+  - signal_decay: как быстро затухает с расстоянием
+  - signal_sensitivity: порог обнаружения
+
+A20.7 Размножение
+
+  Seed packet содержит:
+    genome (параметры развития)
+    stored_energy (начальный запас)
+    dispersal_bias (ветер/животные/вода)
+    dormancy_parameters (сколько ждать благоприятных условий)
+
+  Способы распространения:
+  - Пассивное падение (рядом с родителем)
+  - Ветер (дальность ∝ высота родителя)
+  - Животные (перенос через поедание/прилипание — Roadmap C)
+  - Вода (вдоль водных потоков)
+
+A20.8 Эмерджентные феномены
+
+  Ожидаемые типы растений:
+  🌱 Низкие быстрые колонизаторы (r-стратегия)
+  🌲 Высокие медленные деревья (K-стратегия)
+  🌿 Лианы (растут на чужих каркасах)
+  🍄 Грибные cooperative clusters (обмениваются сигналами)
+  🌵 Экономные drought-виды (минимальная leaf_area, глубокие корни)
+  🌾 Агрессивные световые колонизаторы (быстрый рост, подавление соседей)
+
+A20.9 Защита от эксплойтов
+
+  ПРОБЛЕМА 1: Infinite vertical towers
+    Решение: transport_cost ∝ height² (квадратичный штраф за высоту)
+    Выше некоторой высоты — energy_balance становится отрицательным
+
+  ПРОБЛЕМА 2: Infinite leaf expansion
+    Решение: maintenance_cost ∝ leaf_area + самозатенение
+    Дополнительные листья снижают effective_leaf_area существующих
+
+  ПРОБЛЕМА 3: Signal spam
+    Решение: communication_cost ∝ radius² * intensity
+    Частые/дальние сигналы истощают энергию
+
+  ПРОБЛЕМА 4: Forest lock-in monoculture
+    Решение: seasons (циклическая нагрузка), stochastic disturbances
+    (пожары, болезни), climate oscillations (медленные изменения)
+
+======================================================================
+ЧАСТЬ B: СПЕЦИФИКАЦИИ КОМПОНЕНТОВ (ЧТО)
+======================================================================
+
+B1. NO PRIVILEGED INFORMATION
+----------------------------------------------------------------------
+Агент получает ТОЛЬКО embodied sensors: зрение, проприоцепцию, контакты,
+внутреннее состояние. Никаких world.food_positions, predator_coords, тегов.
+
+----------------------------------------------------------------------
+
+B2. НЕЙРОН (SoA-ПРЕДСТАВЛЕНИЕ)
+----------------------------------------------------------------------
+Файл: aevum/neural/graph/spiking_network.py (использует backend SoA).
+
+SoA структура (GPU-резидентные тензоры PyTorch):
+  membrane_potentials: torch.Tensor [B, N] float32
+  thresholds: torch.Tensor [B, N] float32 (init ~ -55 мВ)
+  resting_potentials: torch.Tensor [B, N] float32 (~ -70 мВ)
+  refractory_counters: torch.Tensor [B, N] int32
+  refractory_periods: torch.Tensor [B, N] int32 (~ 5 subticks)
+  fatigues: torch.Tensor [B, N] float32
+  baseline_excitabilities: torch.Tensor [B, N] float32 (~ 1.0)
+  avg_firing_rates: torch.Tensor [B, N] float32
+  total_spikes: torch.Tensor [B, N] int64
+  is_identity_anchor: torch.Tensor [B, N] bool
+  anchor_stability: torch.Tensor [B, N] float32
+  target_weight_sum: torch.Tensor [N] float32  # гетерогенность (B5.4)
+local_branching_ratio: torch.Tensor [B, N] float32  # B25.8
+bcm_threshold: torch.Tensor [B, N] float32          # B25.2
+neuron_energy: torch.Tensor [B, N] float32          # B25.7
+fatigue_level: torch.Tensor [B, N] float32          # B25.4
+last_spike_tick: torch.Tensor [B, N] int64          # B25.3
+column_id: torch.Tensor [N] int32                   # B25.1
+Механика спайка: V ≥ threshold И refractory_counter == 0 → spike.
+После спайка: V = resting_potential, refractory_counter = refractory_period,
+  fatigue += 1.0, avg_firing_rate = 0.99*old + 0.01*spike_indicator.
+Activity Homeostasis: каждые 1000 тиков, если avg_firing_rate > target_max
+  → baseline_excitability *= 0.99; если < target_min → *= 1.01.
+
+B2.1 PERFORMANCE CONSTRAINT
+  Все операции над тензорами через aevum/neural/dynamics/batch_ops.py.
+  Никаких Python-циклов по нейронам в production.
+  Даже для B=1: тензор имеет форму [1, N].
+
+----------------------------------------------------------------------
+
+B3. СИНАПС (SoA-ПРЕДСТАВЛЕНИЕ)
+----------------------------------------------------------------------
+Хранение: scipy.sparse.csr_matrix для весов + arrays для метаданных.
+  weights: sparse matrix [N, N] float32 (GPU: torch.sparse_coo)
+  delays: torch.Tensor [N, N] int32
+  tenures: torch.Tensor [N, N] int32
+  protected: torch.Tensor [N, N] bool
+  identity_protected: torch.Tensor [N, N] bool
+  eligibility_traces: torch.Tensor [N, N] float32
+  causal_confidences: torch.Tensor [N, N] float32
+  growth_scores: torch.Tensor [N, N] float32
+  last_spike_pair_times: torch.Tensor [N, 2] int32 (pre, post last spike time)
+release_probability: torch.Tensor [N, N] float32    # STD
+depletion_counter: torch.Tensor [N, N] int32        # STD
+Задержка: delay = base (1 sub_tick) + int(L2_distance(pre, post) * 0.5).
+
+----------------------------------------------------------------------
+
+B4. НЕЙРОННЫЙ ГРАФ
+----------------------------------------------------------------------
+Файл: aevum/neural/graph/topology.py.
+
+Структура:
+  neurons: SoA буферы (B2)
+  synapses: sparse matrix + arrays (B3)
+  adjacency_out: dict[int, list[int]] (для быстрой доставки спайков)
+  adjacency_in: dict[int, list[int]]
+  spike_queue: list[tuple[int, torch.Tensor, torch.Tensor]]
+    [(delivery_subtick, pre_mask [B, 1], post_indices [K])]
+  active_neurons_mask: torch.Tensor [B, N] bool
+
+Инициализация топологии: create_initial_topology() создаёт связи:
+  - Сенсорные нейроны → интернейроны: 50% connectivity, weight ~ N(0, 0.1)
+  - Интернейроны → интернейроны: 20% connectivity, weight ~ N(0, 0.05)
+  - Интернейроны → моторные: 50% connectivity, weight ~ N(0, 0.1)
+  - 20% связей помечены как inhibitory (weight *= -1).
+Стоимость роста: cost = 0.1 + 0.01 * distance_euclidean.
+
+B4.3 ACTIVE SUBNETWORKS PER PHASE STATE
+  Функция: subnet_gains = sigmoid(W_subnet @ phase_state)  # [B, 10]
+  gain < 0.1: подсеть заморожена (веса не обновляются, спайки не генерируются).
+  gain 0.1-0.5: inference only (спайки идут, но plasticity = 0).
+  gain > 0.5: полная функциональность.
+
+----------------------------------------------------------------------
+
+B5. ПЛАСТИЧНОСТЬ
+----------------------------------------------------------------------
+B5.1 STDP (векторизованный, модулированный)
+  Файл: aevum/neural/plasticity/stdp.py.
+  Алгоритм:
+    Индексы активных pre/post нейронов из spike_queue.
+    delta_t = pre_spike_times - post_spike_times
+    mask = |delta_t| < window (20 subticks)
+    delta_w = where(delta_t > 0, A_plus*exp(-delta_t/tau), -A_minus*exp(delta_t/tau))
+    delta_w *= dopamine_factor  # модуляция: dopamine*2 + 0.5
+    weights += 0.005 * delta_w
+
+B5.2 Hebbian
+  Файл: aevum/neural/plasticity/hebbian.py.
+  correlation = (firing_rates.T @ firing_rates) / window_size (100)
+  delta = 0.001 * (correlation - 0.01)
+  weights += delta
+
+B5.3 Reward Modulation
+  Если dopamine > 0.6: delta_w = 0.001 * dopamine * eligibility_trace
+
+B5.4 Synaptic Scaling (с гетерогенностью)
+  Каждые 1000 тиков: сумма входящих весов нормализуется.
+  Целевая сумма для нейрона i = 1.0 + ε_i, где ε_i ~ Uniform(-0.1, 0.1)
+  зафиксировано при создании нейрона и не меняется.
+  
+  Это создаёт «индивидуальность» нейронов: одни естественно более
+  возбудимы (сумма > 1.0), другие — менее (сумма < 1.0). Предотвращает
+  формирование однородных пулов и способствует спонтанной дифференциации.
+
+B5.5 Structural Growth
+  growth_score = EMA(corr * error). > 0.05 sustained 200 тиков → новый синапс.
+
+B5.6 Pruning
+  Каждые 2000 тиков: weight < 0.001 sustained 5000 тиков → удалить.
+
+B5.7 Meta-Plasticity
+  effective = base_plasticity / (tenure + 1)
+  × 0.1 если protected, × 0.01 если identity_protected.
+
+----------------------------------------------------------------------
+
+B6. АДАПТИВНЫЕ ДАВЛЕНИЯ
+----------------------------------------------------------------------
+B6.1 Prediction Pressure: MSE(L_pred, L_actual).
+B6.2 Active Inference: два пути уменьшения ошибки (модель/действие).
+B6.3 Uncertainty: дисперсия предсказаний.
+B6.4 Saliency: w1*novelty + w2*error + w3*homeo + w4*damage.
+B6.5 Novelty: 1 - cosine_sim(L_t, ближайший прототип).
+B6.6 Energy Budget: все операции тратят энергию (A12).
+
+----------------------------------------------------------------------
+
+B7. CAUSAL PRESSURE
+----------------------------------------------------------------------
+Sparse intervention tracking. Бюджет 10/тик. Confound suppression.
+
+----------------------------------------------------------------------
+
+B8. PREDICTIVE CALIBRATION
+----------------------------------------------------------------------
+Сравнение confidence vs accuracy каждые 1000 тиков. Коррекция bias.
+
+----------------------------------------------------------------------
+
+B9. IDENTITY ANCHORS
+----------------------------------------------------------------------
+Защита ключевых attractors от пластичности.
+
+----------------------------------------------------------------------
+
+B10. REPRESENTATION LEARNING
+----------------------------------------------------------------------
+B10.1 Latent Encoder (Bottleneck)
+  Сенсоры → линейный слой [total_dim, 64] → ReLU → [64, 32].
+  L1 регуляризация на выходе (λ=0.001).
+  Добавление шума: noise ~ N(0, 0.01) во время обучения.
+
+B10.2 Contrastive Predictive Coding
+  Притяжение L_t и L_{t+1} (cosine_sim → +1). Отталкивание случайных пар.
+
+B10.3 Temporal Coherence: loss += 0.01 * ||L_t - L_{t-1}||².
+
+B10.4 Multimodal Binding: если зрение и проприоцепция одновременно
+  активны → притяжение их partial latents.
+
+B10.5 Sparse Coding: L1 = 0.001 * Σ|latent_i|.
+
+B10.6 СТАБИЛИЗИРОВАННОЕ ЛОКАЛЬНОЕ ОБУЧЕНИЕ
+  a) Predictive Target Injection: L_actual_{t+1} инжектируется как ток
+     в энкодер, нейроны, приблизившие латент к целевому, получают STDP+.
+  b) Sensory Reconstruction: 8 случайных проекций [32, total_dim] фикс.,
+     ошибка реконструкции усредняется → нейромодулятор.
+  c) CPC через линейный считыватель: считыватель [32, total_dim] обучается
+     online δ-правилом, его ошибка → модулятор.
+  d) Batch Normalization: running mean и var по времени. При |latent_i| > 3σ
+     → инжекция шума.
+  e) Warm-up: learning_rate растёт от 0.001 до 0.01 первые 1000 тиков.
+
+B10.7 Predictive Entropy Floor
+  Каждые 100 тиков: H_latent оценка (k-d tree, K=32 ячейки).
+  Если H < 1.0 бит → destabilization_drive активируется.
+
+----------------------------------------------------------------------
+
+B11. TEMPORAL CREDIT ASSIGNMENT
+----------------------------------------------------------------------
+TD(λ): δ = r + 0.95*V(s_{t+1}) - V(s_t). e(s) *= 0.95*0.8, V(s) += 0.01*δ*e(s).
+Eligibility Propagation: затухание с коэффициентом 0.9 за шаг цепочки.
+Hierarchical Replay: приоритет = |δ|.
+
+----------------------------------------------------------------------
+
+B12. ВРЕМЕННАЯ ДИНАМИКА И ПАМЯТЬ
+----------------------------------------------------------------------
+B12.1 Traces: eligibility затухает экспоненциально (0.95/тик).
+B12.2 Replay Buffer: кольцевой, 10000 переходов, формат:
+  (L_t [32], action [n_dofs], L_{t+1} [32], reward float, saliency float,
+   ecology_context [8], timestamp int).
+B12.3 Dual-Memory: быстрые следы (100-500 тиков) → медленная консолидация
+  через replay (5000+ тиков).
+
+----------------------------------------------------------------------
+
+B13. РАЗВИТИЕ
+----------------------------------------------------------------------
+Стадии, спонтанная активность, дифференциация, критические периоды,
+Morphology-Brain Co-Adaptation.
+B13.6: Морфология НЕ меняется при жизни. Мутации — только между поколениями.
+
+----------------------------------------------------------------------
+
+B14. ЭВОЛЮЦИЯ (детали в Roadmap G)
+----------------------------------------------------------------------
+Геном: параметры developmental grammar. Конструктор: build_body_from_genome().
+
+----------------------------------------------------------------------
+
+B15. МОТОРНЫЙ КОНТРОЛЬ
+----------------------------------------------------------------------
+Нейронный CPG, фазовая привязка, motor safety. Детали в A16.3, A1 Phase 2.
+
+----------------------------------------------------------------------
+
+B16. КОММУНИКАЦИЯ
+----------------------------------------------------------------------
+Proto-tokens, trust, social memory, deception, costly signaling.
+
+----------------------------------------------------------------------
+
+B17. СОН
+----------------------------------------------------------------------
+B17.1 REALITY ANCHORING RATIO
+  replay_weight макс. 0.3. Снижается если divergence > budget.
+  Dream Divergence Budget: если среднее расстояние до real manifold > 0.5
+  → replay_confidence *= 0.5, plasticity suppress.
+
+----------------------------------------------------------------------
+
+B18. ДЕТЕКЦИЯ ЭМЕРДЖЕНТНОСТИ
+----------------------------------------------------------------------
+B18.1–B18.8: стандартные детекторы.
+B18.9 CRITICALITY MONITOR: branching > 1.2 → suppression, < 0.8 → exploration.
+B18.10 DEVELOPMENTAL UNLOCK GATING: модуль активен только при stable prerequisites.
+B18.11 CRITICALITY-AS-PHASE: chaotic_suppression / frozen_escape.
+B18.12 CATASTROPHIC SIMPLICITY DETECTOR:
+  Если behavioral_entropy < 0.1, novel_state_visitation < 0.05,
+  prediction_error < 0.01, phase_diversity < 0.2 → ecological perturbation.
+
+----------------------------------------------------------------------
+
+B19. OBSERVABILITY & SCIENTIFIC TOOLING
+----------------------------------------------------------------------
+B19.1 Full Tick Replay (Event-based Sparse): см. A1 Phase 9.
+B19.2 Causal Inspection: логирование причин изменений синапсов.
+B19.3 Neural Time Travel: просмотр состояния сети в любой тик истории.
+B19.4 Emergence Dashboard: в aevum/observability/dashboards/.
+B19.5 Ablation Framework: отключение модулей и сравнение.
+B19.6 Determinism: одинаковый seed → идентичная история тиков.
+
+----------------------------------------------------------------------
+
+B20. SCALABILITY STRATEGY
+----------------------------------------------------------------------
+Active neuron sets, sparse event queue, regional updates, capped neurons,
+topology freezing, lazy replay, local plasticity windows.
+B20.5 MULTI-TIMESCALE PLASTICITY: ms/spikes, sec/STDP, min/replay,
+  hours/structural, gen/evolution.
+B20.6 GPU-RESIDENT TENSOR CONTRACT:
+  Все тензоры нейросети размещены на torch.device('cuda').
+  Адаптер GenesisEngineAdapter возвращает данные как torch.Tensor на том же
+  устройстве без промежуточного numpy. Исключения: observability копии (CPU).
+
+----------------------------------------------------------------------
+
+B24. WORLD ECOLOGY SUBSYSTEM (ДОПОЛНЕНИЕ)
+----------------------------------------------------------------------
+B24.10 Plant Ecology Integration
+
+  Растения существуют в том же мире, что и агенты-животные.
+  Взаимодействия:
+  
+  - Агенты могут есть листья/плоды (resource для животных)
+  - Агенты могут ломать структурные элементы (проходя через лес)
+  - Агенты могут использовать деревья как укрытия
+  - Растения получают углекислый газ от дыхания агентов (bonus)
+  - Семена могут распространяться через животных (поедание + перенос)
+  
+  Конфигурация: config/ecology/plant_ecology.yaml
+    photosynthesis_base_rate: 0.01
+    maintenance_per_biomass: 0.0001
+    transport_per_height: 0.0005
+    max_height: 20.0
+    fungal_signal_cost_factor: 0.001
+
+B25. MICROLEVEL NEURONAL DYNAMICS (ДОПОЛНЕНИЕ К B2-B5)
+----------------------------------------------------------------------
+Низкоуровневые физиологичные механизмы, обеспечивающие самоорганизацию
+без глобальных хардкодных ограничителей.
+
+B25.1 МИКРОКОЛОНКИ И ЛАТЕРАЛЬНОЕ ТОРМОЖЕНИЕ
+  Группировка нейронов в микроколонки (по умолчанию 8-12 нейронов на колонку).
+  
+  Параметры инициализации:
+    column_radius = 0.1 (в нормализованных координатах)
+    column_size = 8 + randint(0, 4)
+    
+  Правила связей внутри колонки:
+    - Внутри: высокая возбуждающая связность (50% вероятности)
+    - Между соседними колонками (distance < 2*radius): латеральное торможение
+    - Латеральные связи: weight = -0.3 ± 0.1, задержка = 1 sub_tick
+  
+  Механизм "победитель":
+    В каждой колонке каждые 10 тиков выбирается нейрон с max(firing_rate).
+    Он получает временный бонус к baseline_excitability (×1.2 на 5 тиков).
+    Остальные получают торможение от него через латеральные связи.
+  
+  Эффект: естественная конкуренция за представление признаков,
+  предотвращает "обобщённый шум" и способствует специализации.
+
+B25.2 BCM-ПРАВИЛО (BIENENSTOCK-COOPER-MUNRO)
+  Адаптивный порог вместо глобальной гомеостазы.
+  
+  Для каждого нейрона i:
+    θ_i (bcm_threshold) — скользящее среднее квадрата его активности.
+    Обновление в конце каждого тика:
+      θ_i = 0.99 * θ_i + 0.01 * (firing_rate_i ** 2)
+    
+    Модификация весов (дополнительно к STDP):
+      Δw_BCM = η_bcm * pre_activity * (post_activity - θ_post)
+      η_bcm = 0.0005 (в 2 раза ниже STDP)
+  
+  Эффект:
+    - Нейроны с хронически высокой активностью повышают порог (десенсибилизация)
+    - Долго молчавшие нейроны становятся чувствительными к слабым сигналам
+    - Автоматическое разделение ролей без хардкодных целевых сумм
+  
+  Конфиг: config/policies/bcm.yaml
+    bcm_learning_rate: 0.0005
+    bcm_tau: 0.99
+    bcm_update_interval: 1 (каждый тик)
+
+B25.3 СТОХАСТИЧЕСКИЙ РЕЗОНАНС (ШУМ КАК РЕСУРС)
+  Шум в мембранный потенциал модулируется неопределённостью.
+  
+  В Phase 1.3 (обновление мембранного потенциала):
+    noise_level = base_noise * (1 + uncertainty_pressure * 3)
+    noise = torch.randn_like(V) * noise_level * dt_neural
+    V += noise
+    
+    Дополнительно: нейроны без спайков > T_quiet получают повышенный шум:
+      if refractory_counter == 0 and last_spike_time > 500 (тиков):
+        noise *= 1 + min(3.0, (time_since_last_spike - 500)/100)
+    
+    Спайк сбрасывает накопленный бонус к шуму.
+  
+  Эффект:
+    - При неопределённости мозг "щупает" пространство
+    - "Застрявшие" нейроны получают шанс вырваться из локального минимума
+    - Нет хардкодного random_jump — всё через физику шума
+
+B25.4 ACTIVITY-DEPENDENT РЕФРАКТЕРНОСТЬ
+  Рефрактерный период растёт с усталостью нейрона.
+  
+  Структура (добавить в B2):
+    fatigue_level: torch.Tensor [B, N] float32 (0..10)
+    refractory_periods: torch.Tensor [B, N] int32 (dynamic)
+  
+  Обновление после спайка:
+    fatigue_level += 1.0
+    refractory_period = base_refractory (5) + int(fatigue_level / 2)
+  
+  Каждый тик (если нейрон не спайкал):
+    fatigue_level *= 0.998 (медленное восстановление, τ=500 тиков)
+  
+  Эффект:
+    - Предотвращает pathological bursting
+    - Нейрон, спайкающий на 1000 Гц, получает долгий рефрактер (до 10+)
+    - Естественный gain control без MAX_GLOBAL_ACTIVITY
+
+B25.5 НЕЙРОМОДУЛЯЦИЯ СПАЙКОВОГО ПОРОГА
+  Серотонин и норадреналин динамически меняют порог возбуждения.
+  
+  В Phase 1.4 (проверка порога):
+    effective_threshold = threshold * (
+        1 
+        + 0.5 * serotonin      # повышает порог → устойчивость
+        - 0.3 * noradrenaline  # снижает порог → возбудимость
+        + 0.1 * acetylcholine  # небольшое снижение (внимание)
+    )
+    effective_threshold = clamp(effective_threshold, 0.7*threshold, 1.5*threshold)
+  
+  Эффект:
+    - Высокий норадреналин → режим сканирования, лёгкое возбуждение
+    - Высокий серотонин → жди чёткого сигнала, не дёргайся на шум
+    - Связывает глобальное состояние с микроуровнем
+
+B25.6 КРАТКОВРЕМЕННАЯ СИНАПТИЧЕСКАЯ ДЕПРЕССИЯ (STD)
+  Пресинаптическое истощение — чувствительность к темпу спайков.
+  
+  Структура синапса (добавить в B3):
+    release_probability: torch.Tensor [N, N] float32 (init 0.5)
+    depletion_counter: torch.Tensor [N, N] int32 (init 0)
+  
+  При каждом пресинаптическом спайке:
+    if release_probability > random():
+        spike_передаётся
+        release_probability *= 0.95
+        depletion_counter += 1
+    else:
+        spike_теряется
+    
+    Восстановление каждый тик (независимо от активности):
+        release_probability += (0.05 - 0.001 * depletion_counter)
+        release_probability = min(0.95, release_probability)
+        depletion_counter = max(0, depletion_counter - 1)
+  
+  Эффект:
+    - Серия из 10 спайков за 5 мс: release_probability падает с 0.5 до 0.5*0.95^10 ≈ 0.3
+    - Последующие спайки с высокой вероятностью не пройдут
+    - Кодирует "внезапность" и "темп", а не просто "факт спайка"
+    - Естественное подавление runaway на микроуровне
+
+B25.7 ЭНЕРГЕТИЧЕСКИЙ БЮДЖЕТ НЕЙРОНА
+  У каждого нейрона свой энергетический резерв, метаболическая поддержка.
+  
+  Структура (добавить в B2):
+    neuron_energy: torch.Tensor [B, N] float32 (init 1.0)
+    energy_demand: torch.Tensor [B, N] float32 (0.001 per spike)
+  
+  При попытке спайка (Phase 1.4):
+    if neuron_energy < 0.1:
+        effective_threshold *= 3.0  # почти невозможно спайкнуть
+    else:
+        neuron_energy -= energy_demand
+        # спайк происходит
+  
+  Метаболическая поддержка (каждый тик):
+    global_energy_pool = sum(agent.energy)  # из EnergySystem
+    # Перераспределение в пользу важных нейронов
+    importance = saliency + prediction_error + (1 - neuron_energy)
+    allocation = softmax(importance) * 0.01 * global_energy_pool
+    neuron_energy += allocation
+    
+    Базовое восстановление: neuron_energy += 0.0001 (минимальный метаболизм)
+    neuron_energy = clamp(neuron_energy, 0.0, 2.0)
+  
+  Эффект:
+    - "Кричащие" нейроны тратят энергию, "молчаливые" накапливают
+    - Важные нейроны (высокая saliency) получают поддержку
+    - Связь между физической усталостью и вычислениями
+
+B25.8 ЛОКАЛЬНЫЙ BRANCHING RATIO
+  Каждый нейрон контролирует свою "влиятельность".
+  
+  Для каждого нейрона i:
+    pre_spikes[t] = число спайков i
+    post_spikes[t] = сумма спайков всех постсинаптических нейронов j
+    local_branching[t] = post_spikes[t] / (pre_spikes[t] + epsilon)
+    
+    Обновление скользящего среднего:
+      local_branching_ema = 0.99 * old + 0.01 * current
+    
+    Гомеостаз (каждые 100 тиков):
+      if local_branching_ema > 1.5:
+          # нейрон слишком влиятельный — усилить его тормозные связи
+          for each outgoing synapse:
+              if inhibitory: weight *= 1.05
+              else: weight *= 0.95
+      elif local_branching_ema < 0.5:
+          # нейрон-изгой — усилить его возбуждающие связи
+          for each outgoing synapse:
+              if excitatory: weight *= 1.05
+              else: weight *= 0.95
+  
+  Эффект:
+    - Предотвращает диктатуру одного нейрона
+    - "Мёртвые" нейроны получают шанс вернуться в игру
+    - Самоорганизующаяся сеть без хардкодного pruning по весу
+
+B25.9 ИНТЕГРАЦИЯ В TICK PIPELINE
+  B25.1: выполняется при инициализации топологии (один раз)
+  B25.2: Phase 6 (пластичность) — BCM update
+  B25.3: Phase 1.3 (мембранный потенциал) — добавка шума
+  B25.4: Phase 1.4-1.5 (после спайка) — обновление fatigue и refractory
+  B25.5: Phase 1.4 (проверка порога) — модуляция порога
+  B25.6: Phase 1.6 (доставка спайков) — STD фильтр
+  B25.7: Phase 3 (EnergySystem) + Phase 1.4 — энергия нейрона
+  B25.8: Phase 6 (пластичность) — обновление local_branching и гомеостаз
+======================================================================
+ЧАСТЬ C: ROADMAPS (ПОСЛЕДОВАТЕЛЬНОСТЬ РЕАЛИЗАЦИИ)
+======================================================================
+
+Порядок: Roadmap 0 → 1 → 2 → 3 → 4 → 5 → 6.
+Roadmap'ы X, V, S, C, G развиваются параллельно.
+
+ROADMAP 0: НИЖНИЙ МОЗГ (Motor Control)
+  0.1 Нейронный CPG (без sin, ингибиторные связи)
+  0.2 Фазовая привязка (контакт → ток)
+  0.3 Рефлексы с фазовой модуляцией
+  0.4 Стабилизация тела (корректирующие мышцы)
+  0.5 Обучение через Reward (TD-Learning)
+  0.6 Командный интерфейс (модуляция CPG)
+  0.7 Сенсорная абстракция (attractor states «иду/стою/упал»)
+  0.8 Эфферентная копия (предсказание сенсорики)
+
+ROADMAP 1: СРЕДНИЙ МОЗГ (Behavior Layer)
+  1.1 Гомеостаз (драйв от отклонения energy/безопасности)
+  1.2 Базовые эмоции (боль → страх)
+  1.3 Эфферентная копия (усиленная: предсказание внутренних состояний)
+  1.4 Внимание (салиентность, Top-K)
+  1.5 Сенсорная абстракция (прото-токены)
+  1.6 Выбор действия с гистерезисом
+  1.7 Привычки (частота успеха → бонус)
+  1.8 Краткосрочная память (кольцевой буфер)
+
+ROADMAP 2: ВЕРХНИЙ МОЗГ (Cognitive Layer)
+  2.1 Предиктивная модель мира (L_t, A_t → L_{t+1})
+  2.2 Ошибка предсказания как сигнал
+  2.3 Симуляции с доверием
+  2.4 Эпизодическая память (эмоциональные события)
+  2.5 Сложные эмоции (фрустрация, любопытство)
+  2.6 VETO (блокировка плохого исхода)
+  2.7 DMN (replay в покое, с DMN Interleaving: 70% replay, 30% симуляции)
+
+ROADMAP 3: МЕТА‑УРОВЕНЬ (Self & Meta-Cognition)
+  3.1 Самомодель (вектор «Я»)
+  3.2 Рекурсивное состояние (тренды успехов/ошибок)
+  3.3 Дирижёр внимания (распределение ресурсов)
+  3.4 Детектор неопределённости с бюджетом
+  3.5 Сон (replay + pruning)
+  3.6 Энергетическая модель (мышление тратит энергию)
+  3.7 Safe Mode (рефлексы при critical energy)
+
+ROADMAP 4: АДАПТИВНЫЙ ИНТЕЛЛЕКТ (Structural Plasticity)
+  4.1 Meta-Learning (пластичность обратна tenure)
+  4.2 Структурная пластичность (через growth eligibility trace)
+  4.3 Модулярность (кластеры, межмодульная пластичность ↓)
+  4.4 Абстрактные представления (bottleneck)
+  4.5 Curiosity & Empowerment (ошибка + расширение state-space)
+  4.6 Глубокое планирование (дерево 2-5 шагов)
+  4.7 Контроль неопределённости
+  4.8 Робастность к шуму
+
+ROADMAP 5: СУБЪЕКТИВНЫЙ РАЗУМ (Subjective Experience)
+  5.1 Global Workspace (1-3 процесса, с гистерезисом фокуса)
+  5.2 Поток мыслей (ассоциации из памяти, с Thought Noise σ=0.1
+      и Random Jump p=0.02)
+  5.3 Контекст (working context, затухание с τ_decay = 5-10 тиков)
+  5.4 Самомодель «Я»
+  5.5 Эфферентная копия для «Я» (с ретроспективным усилением авторства)
+  5.6 Внутренний конфликт
+  5.7 Рефлексия (meta-thinking)
+  5.8 Субъективное время
+  5.9 Стиль мышления (личность)
+
+ROADMAP 6: СОЗНАНИЕ КАК ЭФФЕКТ
+  6.0 Требует полной работоспособности 0-5.
+  6.1 Режим «Осознания» (при неопределённости)
+  6.2 Усиленный VETO
+  6.3 Чувство контроля (agency)
+  6.4 Самооценка
+  6.5 Нарративная память
+  6.6 Иллюзия выбора (ретроспективное усиление self→action связи)
+  6.7 Мета-монитор
+  6.8 Стабильность изменений
+
+ROADMAP X: ЯЗЫК И СЕМАНТИЧЕСКАЯ ПАМЯТЬ
+  X.1 Прото-токены (кластеризация)
+  X.2 Семантическая память (граф токенов)
+  X.3 Внутренний язык
+  X.4 Привязка к реальному языку (без LLM)
+  X.5 Разделение на «объекты» и «действия»
+  X.6 Коммуникация между агентами
+  X.7 Внутренний монолог (self-talk)
+  X.8 Инструментальная ложь
+
+ROADMAP V: ВОПЛОЩЁННОЕ ЗРЕНИЕ (Embodied Vision)
+  V.1 3D проекционная камера
+  V.2 Retina-препроцессинг (ON/OFF, края)
+  V.3 Визуальное сжатие (bottleneck)
+  V.4 Predictive Visual Learning
+  V.5 Visual-Semantic Grounding
+  V.6 Attention-Controlled Gaze
+  V.7 Object Permanence
+  V.8 Multimodal Fusion
+
+ROADMAP S: СОН И ОФЛАЙН-КОНСОЛИДАЦИЯ
+  S.1 Energy-Triggered Sleep
+  S.2 Prioritized Episodic Replay
+  S.3 Counterfactual Simulation
+  S.4 Global Synaptic Downscaling
+  S.5 Protected Memory Restoration
+  S.6 Semantic Compression
+  S.7 Dream Exploration (креативность)
+  S.8 Memory Pruning Economy
+
+ROADMAP C: СОЦИАЛЬНОЕ ПОЗНАНИЕ
+  C.1 Semantic Message Packets
+  C.2 Social Belief Graph
+  C.3 Многомерное доверие
+  C.4 Обучение на чужом опыте
+  C.5 Shared Episodic Transfer
+  C.6 Social Uncertainty Resolution
+  C.7 Системы репутации
+  C.8 Культурная память
+
+======================================================================
+ROADMAP G: ЭВОЛЮЦИЯ И НАСЛЕДОВАНИЕ
+======================================================================
+Принцип: Геном — параметры developmental grammar. Эволюция — в пространстве
+параметров. morphology_builder.py — детерминированная функция.
+
+G.1 Каноническое пространство морфологии (canonical_body_plan.yaml)
+  Параметры: bilateral_symmetry, spine_segments [2,12], limb_pairs [1,6],
+  limb_segment_count [1,5], limb_attachment_points list, spine_length [0.3,3.0],
+  limb_base_length [0.1,1.5], segment_length_decay [0.5,1.0],
+  stance_width [0.05,0.5], muscle_density [0.5,2.0], muscle_max_force [10,200],
+  tail_enabled, tail_segments [0,6], center_of_mass_bias [-0.3,0.3].
+
+G.2 Конструктор тела: build_body_from_genome() → создаёт позвоночник, конечности,
+  мышцы. Валидация встроена (симметрия, достижимость).
+
+G.3 Система атрибуции: собирает embodied pressure tensor (P_morph).
+G.4 Embodied Counterfactual Morphogenesis.
+G.5 Мутации (гауссов шум + attribution-вектор).
+G.6 Репродукция (бесполая на MVP, берёт top-3 из lineage_cloud).
+G.7 Морфологическая новизна (anti-convergence).
+G.8 Developmental Noise (шум при старте тела).
+G.9 Морфологический бюджет (max_total_bones=30, max_muscles=60 и т.д.).
+G.10 Наследование когнитивных параметров (curiosity_gain, risk_aversion, ...).
+G.11 Morphological Shock Phase.
+
+======================================================================
+ЧАСТЬ K: КОНФИГУРАЦИИ (RUNTIME-CONFIGURABLE POLICIES)
+======================================================================
+K.1 config/policies/plasticity.yaml (corr_threshold=0.3, err_threshold=0.2, ...)
+K.2 config/policies/pressures.yaml (survival_threshold=0.1, ...)
+K.3 config/canonical_body_plan.yaml
+K.4 config/morphology_budget.yaml
+K.5 config/policies/phases.yaml (inhibition_weights, decay_rates, self_exc, ...)
+K.6 config/ecology/plant_ecology.yaml
+K.7 config/policies/bcm.yaml (B25.2)
+  bcm_learning_rate: 0.0005
+  bcm_tau: 0.99
+  bcm_update_interval: 1
+  
+K.8 config/neurons/microcolumns.yaml (B25.1)
+  column_radius: 0.1
+  column_size_min: 8
+  column_size_max: 12
+  lateral_inhibition_weight: -0.3
+======================================================================
+ЧАСТЬ F: OBSERVABILITY & SCIENTIFIC DEBUGGING ARCHITECTURE
+======================================================================
+Файлы: aevum/observability/, aevum/experimentation/.
+
+F1. TEMPORAL TIME-MACHINE DEBUGGER (Seed-Based Forking)
+  F1.1 Snapshot: для каждого тика сохраняются seed, моторные команды, все
+    случайные решения агента (в детерминированном виде).
+  F1.2 Fork: создаётся новый env с тем же seed. Проматывается от 0 до T-1
+    с сохранёнными действиями. На тике T можно изменить любой параметр и
+    продолжить.
+  F1.3 Bifurcation Analysis: поиск точек расхождения при малых изменениях.
+  F1.4 Timeline Browser: визуальный браузер параллельных реальностей.
+
+F2. ATTRACTOR TOPOLOGY SCANNER
+  F2.1 Систематический запуск perturbations в phase_state.
+  F2.2 Построение basin of attraction maps.
+  F2.3 Визуализация метастабильных состояний и переходов.
+
+F3. CAUSAL SURGERY LAB
+  F3.1 Lesion Toolkit: временное отключение подсистем/нейромодуляторов/связей.
+  F3.2 Анализ: что рушится, что компенсируется.
+  F3.3 Automated Lesion Battery: стандартные тесты.
+
+F4. DREAM INSPECTOR
+  F4.1 Replay Trajectory Viewer (в латентном пространстве).
+  F4.2 Dream Divergence Heatmap.
+  F4.3 Reality Anchoring Monitor.
+  F4.4 Replay-to-Reality Ratio.
+  F4.5 Dream-Induced Synaptic Change Tracker.
+
+F5. ECOLOGICAL FIELD VISUALIZER
+  F5.1 Resource Heatmap. F5.2 Migration Streams. F5.3 Predator-Prey Waves.
+  F5.4 Sleep-Density Maps. F5.5 Information Flow Fields. F5.6 Cultural Maps.
+  F5.7 Plant Canopy Map. F5.8 Fungal Network Graph.
+
+F6. POPULATION PHYLOGENY EXPLORER
+  F6.1 Lineage Tree. F6.2 Morphology Evolution Replay. F6.3 Drive Evolution.
+  F6.4 Extinction Analysis. F6.5 Innovation Tracker. F6.6 Ancestral Reconstruction.
+
+F7. NEURAL ARCHAEOLOGY
+  F7.1 Attractor Provenance (как возник).
+  F7.2 Synaptic History (полная история изменений).
+  F7.3 Memory Genealogy (трансформация через консолидации).
+
+F8. EMERGENCE DETECTION ENGINE v2
+  F8.1 Behavioural Clustering. F8.2 Anomaly Detection.
+  F8.3 Motif Discovery. F8.4 Spontaneous Protocol Detection.
+  F8.5 Emergence Alert System (avalanche, модульность, планирование и т.д.).
+
+F9. MULTI-SCALE OBSERVATION DASHBOARD
+  F9.1 Synchronized views: ms (spikes), sec (behavior), min (habits),
+    hours (personality), gen (evolution).
+  F9.2 Zoom In/Out (Google Maps для cognition).
+  F9.3 Cross-Scale Correlation.
+
+F10. INTERNAL LANGUAGE PROBE
+  F10.1 Semantic Drift. F10.2 Token Grounding Maps.
+  F10.3 Symbol Genealogy. F10.4 Communication Compression Metrics.
+
+F11. COMPUTATIONAL IMMUNE SYSTEM
+  F11.1 Detectors (runaway_replay, attractor_collapse, entropy_death, ...).
+  F11.2 Responses (throttle, freeze, snapshot, rollback, alert, inject_diversity).
+  F11.3 Immune Memory (обучение на прошлых инцидентах).
+
+F12. SCIENTIFIC MODE
+  F12.1 Experiment Definition (independent var, sweep values, replicates).
+  F12.2 Automated Sweeps. F12.3 Ablation Framework.
+  F12.4 Hypothesis Testing (p-value, visualisation).
+  F12.5 Reproducibility Guarantee (seed, config, snapshot).
+  F12.6 Experiment Database (сравнение, поиск).
+
+F13. OBSERVABILITY INFRASTRUCTURE
+  F13.1 ObservabilityServer (отдельный процесс/поток).
+  F13.2 API Layer (REST + GraphQL + Python SDK).
+  F13.3 Computational Budget (свой лимит CPU, degradation modes).
+
+======================================================================
+MVP PHASES (ПЕРЕСМОТРЕННЫЕ)
+======================================================================
+PHASE 0: «Базовый Tick Scheduler + Phase Manifold Core»
+  - Sub-tick нейросети (10 подшагов)
+  - Sleep Physics Policy (Exclusion)
+  - GPU-Resident Tensors
+  - Seed-based Forking
+  - All Contracts (A13, A18, A19)
+  - W_pressure_to_drive с bounded adaptation
+  - Базовый мышечный тонус
+  - Гетерогенность нейронов
+
+PHASE 1: «Creature that learns to walk»
+  - CPG + STDP + Hebbian
+  - Energy homeostasis + Resource Economy
+  - Основные drives: exploitation, defensive, panic, recovery
+  - Глобальные sleep epochs (для отладки)
+  - Catastrophic Simplicity Detector
+
+PHASE 2: «World model emerges»
+  - Latent Encoder + PredictorPool + Entropy Floor
+  - Destabilization + Suppression drives
+  - Exploration drive полный
+  - Ecological Latent Context базовый
+  - DMN Interleaving (70/30)
+
+PHASE 3: «Adaptive individuality»
+  - Identity anchors + Meta-plasticity + Neuromodulators
+  - Developmental stages + Morphological Shock
+  - Sleep hybrid (light/deep) с Reality Anchoring
+  - Asynchronous sleep базовый
+  - Ретроспективное усиление авторства
+  - Гистерезис в Global Workspace
+
+PHASE 4: «Population ecology + Plants»
+  - Embodied Counterfactual Morphogenesis
+  - Social drive полный
+  - Circadian Pressure Field
+  - Asynchronous sleep полный (эмерджентные ночные/дневные виды)
+  - Plant Ecology (A20): структура, листья, корни, growth buds
+  - Fungal Communication Network
+
+PHASE 5: «Proto-symbolic cognition»
+  - Proto-tokens + Semantic memory + Communication
+  - Thought Noise + Random Jump
+  - Затухание старых мыслей
+  - Plant evolution + co-evolution с животными
+
+======================================================================
+ЧЕКЛИСТ ГОТОВНОСТИ К ЗАПУСКУ
+======================================================================
+- [ ] Sub-tick работает: 10 подшагов нейросети на 1 физический шаг
+- [ ] Deep Sleep Exclusion: тела удаляются/добавляются без ошибок
+- [ ] Seed-based Forking: проматывание с одинаковым seed даёт идентичный результат
+- [ ] GPU-Resident Tensors: нет копирований numpy для вычислений
+- [ ] Stability Contracts (A13): 10000 тиков без runaway
+- [ ] No NaN в тензорах на протяжении 100000 тиков
+- [ ] Phase Manifold: attractor sharpening работает
+- [ ] Influence Budget Matrix: нет скрытых петель
+- [ ] Timescale Separation: fast не переписывает slow
+- [ ] Гетерогенность нейронов: target_weight_sum варьируется
+- [ ] Базовый мышечный тонус: мышцы имеют min сигнал
+- [ ] Гистерезис в Global Workspace: фокус не прыгает
+- [ ] DMN Interleaving: 70/30 микс replay/симуляций
+- [ ] Растения: фотосинтез, рост, самозатенение работают
+- [ ] Fungal Network: сигналы передаются с затуханием и шумом
+- [ ] Morphology Builder: любое тело из canonical_body_plan валидно
+- [ ] Детерминизм (B19.6): одинаковый seed → идентичная история
+- [ ] Computational Immune System: alerts срабатывают на тестовых нарушениях
+- [ ] Микроколонки работают (нейроны сгруппированы, латеральное торможение)
+- [ ] BCM-правило стабилизирует активность без глобальной гомеостазы
+- [ ] Шум усиливается при uncertainty > 0.5
+- [ ] Fatigue-зависимый рефрактер предотвращает bursting
+- [ ] Серотонин/норадреналин модулируют порог в реальном времени
+- [ ] Short-Term Depression фильтрует высокочастотные серии
+- [ ] Нейроны имеют энергию, важные получают поддержку
+- [ ] Локальный branching ratio держится в [0.5, 1.5]
+======================================================================
+КОНЕЦ ДОКУМЕНТА
+======================================================================

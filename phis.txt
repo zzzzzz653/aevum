@@ -1,0 +1,1516 @@
+﻿###############################################################################
+SIMULATION RUNTIME — ПОЛНЫЙ ПЛАН ВСЕХ ЭТАПОВ
+Архитектурный план v4.0 — ВЫЧИСЛИТЕЛЬНЫЙ БИОМ ДЛЯ AEVUM
+###############################################################################
+
+###############################################################################
+ФУНДАМЕНТАЛЬНЫЕ ПРИНЦИПЫ (ВСЕ ЭТАПЫ)
+###############################################################################
+
+1. DATA-ORIENTED DESIGN
+   ВСЁ лежит в SoA (Structure of Arrays). Никаких объектов с виртуальными
+   методами и указателями на куче для горячих данных.
+
+2. GPU-FIRST, CPU-COMPATIBLE
+   Единый лэйаут данных для CPU и GPU. Структуры сразу проектируются под
+   выравнивание GPU (std430). CPU-режим — те же данные, тот же код,
+   просто executing на CPU через заглушки.
+
+3. TRIPLE BUFFERING GPU↔CPU
+   Три буфера: GPU Compute пишет в BUFFER_A, GPU Render читает BUFFER_B,
+   CPU Reader асинхронно читает BUFFER_C. Ротация по готовности fence.
+   CPU НИКОГДА не ждёт GPU. Максимальная задержка — 2 кадра.
+
+4. DETERMINISTIC-READY
+   Два режима с первого дня:
+   - FAST: производительность, разрешён параллелизм, float-оптимизации
+   - DETERMINISTIC: строгий порядок операций, программные sin/cos/sqrt,
+     фиксированный порядок обхода, идентичность на разных архитектурах
+
+5. PROFILER-INTEGRATED
+   Замеры CPU (std::time::Instant) и GPU (timestamp queries) для каждой
+   системы. Per-frame статистика в debug, агрегированная в release.
+
+6. RECORD/REPLAY — ТРЁХУРОВНЕВАЯ СИСТЕМА
+   - Hot Ring Buffer: последние K=1000 тиков в памяти (всегда, ~бесплатно)
+   - Event-Triggered Snapshots: автосохранение по детекторам событий
+   - Deterministic Replay: seed + начальное состояние → любой тик
+     пересчитывается побитово
+
+7. SYSTEMIC EVENTS, НЕ SCRIPTED
+   Все события возникают из комбинации факторов среды.
+   Никаких "spawn_enemy_at_tick_500".
+
+8. SENSOR REALISM
+   Никакой прямой информации об объектах. Только сырые данные + шум.
+   Агент должен САМ научиться интерпретировать сенсоры.
+
+9. TENSOR-FIRST
+   Все данные для нейросетей — тензоры на GPU.
+   Никаких копирований CPU↔GPU для сенсоров и моторных команд.
+
+10. STREAMING WORLD
+    Только активные чанки в памяти. Остальное спит или на диске.
+
+###############################################################################
+СТРУКТУРА CRATE (ПОЛНАЯ)
+###############################################################################
+
+sim_core/
+├── Cargo.toml
+│   зависимости: wgpu, bytemuck, serde, bincode, rayon, parking_lot,
+│                glam, egui, egui-wgpu, egui-winit, npy, pyo3, rand,
+│                rand_xoshiro, memmap2, smallvec, noise
+│
+├── src/
+│   ├── main.rs                          # точка входа (headless / окно)
+│   ├── lib.rs                           # библиотека для Python (PyO3)
+│   │
+│   ├── world/                           # ═══ ECS ЯДРО ═══
+│   │   ├── mod.rs
+│   │   ├── archetype.rs                 # SoA-хранилище, swap_remove
+│   │   ├── entity.rs                    # EntityId (index + generation)
+│   │   ├── world.rs                     # World: архетипы, спавн, запросы
+│   │   ├── query.rs                     # Итераторы по архетипам
+│   │   └── component_mask.rs            # ComponentMask (u64 битовая маска)
+│   │
+│   ├── components/                      # ═══ КОМПОНЕНТЫ (ТОЛЬКО ДАННЫЕ) ═══
+│   │   ├── mod.rs
+│   │   ├── transform.rs                 # Position, Rotation, Velocity, AngularVelocity
+│   │   ├── physics.rs                   # RigidBody (BodyType + CollisionShape), Mass, Force, Torque
+│   │   ├── collision.rs                 # AABB, ContactManifold
+│   │   ├── joints.rs                    # JointConstraint
+│   │   ├── muscles.rs                   # MuscleConstraint
+│   │   ├── sensors.rs                   # Sensor, SensorType, SensorData
+│   │   ├── health.rs                    # Health, DamageEvent
+│   │   ├── disease.rs                   # Disease, Infection, ImmuneMemory
+│   │   ├── material.rs                  # MaterialId
+│   │   ├── creature.rs                  # CreatureInstance (ссылки на части тела)
+│   │   └── meta.rs                      # TickData, EntityMeta
+│   │
+│   ├── scheduler/                       # ═══ ПЛАНИРОВЩИК ═══
+│   │   ├── mod.rs
+│   │   ├── system.rs                    # System trait
+│   │   ├── executor.rs                  # Thread pool, граф зависимостей
+│   │   └── stage.rs                     # Stage pipeline
+│   │
+│   ├── systems/                         # ═══ СИСТЕМЫ ═══
+│   │   ├── mod.rs
+│   │   ├── gravity.rs                   # F = m*g
+│   │   ├── integrate.rs                 # Semi-implicit Euler + substeps
+│   │   ├── clear_forces.rs             # Обнуление Force/Torque
+│   │   ├── update_aabb.rs              # Обновление AABB
+│   │   ├── tick_counter.rs             # Инкремент глобального счётчика
+│   │   ├── sleep_manager.rs            # Sleeping для неподвижных тел
+│   │   ├── damage.rs                    # Расчёт повреждений от столкновений
+│   │   └── disease_system.rs           # Распространение и влияние болезней
+│   │
+│   ├── physics/                         # ═══ ФИЗИКА ═══
+│   │   ├── mod.rs
+│   │   ├── broadphase.rs               # SpatialHashGrid (GPU)
+│   │   ├── narrowphase.rs              # GJK/EPA, ContactManager
+│   │   ├── constraints.rs              # ConstraintBatch, JointType, XPBD solver
+│   │   ├── muscles.rs                   # Muscle constraint (XPBD distance)
+│   │   ├── integrator.rs               # IntegratorConfig, полный цикл с substeps
+│   │   ├── creature_builder.rs         # build_from_json()
+│   │   ├── materials/
+│   │   │   ├── mod.rs
+│   │   │   ├── material.rs             # Material { friction, density, ..., burn_rate, ... }
+│   │   │   └── loader.rs               # Загрузка из YAML
+│   │   └── stability.rs                # Проверки стабильности (energy audit, joint audit)
+│   │
+│   ├── environment/                     # ═══ МИР (ОКРУЖЕНИЕ) ═══
+│   │   ├── mod.rs
+│   │   ├── terrain.rs                   # Heightfield terrain, генерация, LOD
+│   │   ├── water.rs                     # Shallow water simulation
+│   │   ├── climate.rs                   # Temperature, humidity, wind, pressure
+│   │   ├── weather.rs                   # Облака, осадки
+│   │   ├── seasons.rs                   # Циклы сезонов и дня
+│   │   ├── biome.rs                     # Биомы по высоте и влажности
+│   │   └── streamer.rs                  # WorldStreamer: чанки, подгрузка/выгрузка
+│   │
+│   ├── sensors/                         # ═══ СЕНСОРЫ ═══
+│   │   ├── mod.rs
+│   │   ├── vision.rs                    # GPU render-to-texture, RGB камера
+│   │   ├── hearing.rs                   # Sound events, затухание, окклюзия
+│   │   ├── smell.rs                     # Diffusion field, chemical_signature
+│   │   ├── touch.rs                     # Контактные силы, материал, температура
+│   │   ├── proprioception.rs            # Углы суставов, IMU, внутреннее состояние
+│   │   └── noise.rs                     # Общая система шума для всех сенсоров
+│   │
+│   ├── events/                          # ═══ СЛУЧАЙНЫЕ СОБЫТИЯ ═══
+│   │   ├── mod.rs
+│   │   ├── event.rs                     # Event enum (все типы событий)
+│   │   ├── bus.rs                       # Per-thread local buffers → merge
+│   │   ├── triggers.rs                  # Systemic trigger conditions
+│   │   ├── wildfire.rs                  # Пожары
+│   │   ├── earthquake.rs                # Землетрясения
+│   │   ├── flood.rs                     # Наводнения
+│   │   ├── storm.rs                     # Ураганы / штормы
+│   │   ├── drought.rs                   # Засуха
+│   │   ├── volcano.rs                   # Вулканы (опционально)
+│   │   └── disease_outbreak.rs          # Вспышки болезней
+│   │
+│   ├── scene/                           # ═══ СЦЕНА ═══
+│   │   ├── mod.rs
+│   │   ├── ground.rs                    # Статичный ground plane
+│   │   ├── spawner.rs                   # spawn_sphere, spawn_box, spawn_creature
+│   │   └── camera.rs                    # Flycam + режимы
+│   │
+│   ├── render/                          # ═══ ВИЗУАЛИЗАТОР-ОТЛАДЧИК ═══
+│   │   ├── mod.rs
+│   │   ├── gpu_state.rs                # wgpu Device, Queue, SwapChain
+│   │   ├── pipelines.rs                # Instanced sphere/box/capsule/line rendering
+│   │   ├── buffers.rs                  # GPU buffers для трансформаций
+│   │   ├── debug_draw.rs              # Overlay: AABB, векторы скоростей, контакты, скелет
+│   │   ├── camera_controller.rs        # Flycam + режимы (FreeFly, Orbit, FirstPerson, SensorView)
+│   │   └── ui.rs                        # egui интеграция (панели, инспектор, timeline)
+│   │
+│   ├── record/                          # ═══ RECORD / REPLAY ═══
+│   │   ├── mod.rs
+│   │   ├── snapshot.rs                  # Snapshot (stable binary schema)
+│   │   ├── delta.rs                     # DeltaEntry (битовая маска + значения)
+│   │   ├── hot_ring.rs                  # HotRingBuffer (последние 1000 тиков в памяти)
+│   │   ├── recorder.rs                 # Recorder: триггеры событий, запись снапшотов
+│   │   ├── replayer.rs                 # Replayer: seek, загрузка снапшотов + дельты
+│   │   ├── deterministic.rs            # DeterministicReplay: seed + inputs
+│   │   └── triggers.rs                 # EventDetector trait + SnapshotTrigger enum
+│   │
+│   ├── bridge/                          # ═══ PYTHON ↔ RUST ═══
+│   │   ├── mod.rs
+│   │   ├── python_api.rs               # PyO3: Simulation class
+│   │   └── tensor_bridge.rs            # Передача тензоров без копирования
+│   │
+│   ├── profiler/                        # ═══ ВСТРОЕННЫЙ ПРОФИЛЕР ═══
+│   │   ├── mod.rs
+│   │   ├── timing.rs                   # CpuTimer, GpuTimer
+│   │   ├── counters.rs                # Счётчики: entities, contacts, allocations
+│   │   └── reporter.rs                # Вывод: консоль, JSON, Python
+│   │
+│   └── validate/                        # ═══ ТЕСТОВЫЙ НАБОР ═══
+│       ├── mod.rs
+│       └── tests.rs
+
+###############################################################################
+КЛЮЧЕВЫЕ СТРУКТУРЫ ДАННЫХ
+###############################################################################
+
+--- ENTITY ---
+
+EntityId:
+    index: u32           # индекс в архетипе
+    generation: u32      # поколение (alive/dead проверка)
+
+packed: u64 = ((generation as u64) << 32) | (index as u64)
+
+--- COMPONENT MASK ---
+
+ComponentMask:
+    bits: u64            # битовая маска компонентов (до 64 типов)
+
+--- BODY TYPE ---
+
+BodyType:
+    Static      = 0      # не интегрируется, не двигается (земля, стены)
+    Dynamic     = 1      # интегрируется, реагирует на силы
+    Kinematic   = 2      # не интегрируется, двигается скриптом
+
+--- COLLISION SHAPE ---
+
+CollisionShape:
+    tag: u32             # Sphere=0, Box=1, Capsule=2, Cylinder=3,
+                          # ConvexHull=4, HeightField=5, None=6
+    # Sphere:
+    radius: f32
+    # Box:
+    half_extents: [f32; 3]
+    # Capsule:
+    capsule_radius: f32
+    capsule_half_height: f32
+    # Cylinder:
+    cylinder_radius: f32
+    cylinder_half_height: f32
+    # ConvexHull:
+    hull_vertex_offset: u32
+    hull_vertex_count: u32
+    # HeightField:
+    hf_width: u32
+    hf_height: u32
+    hf_data_offset: u32
+
+Примечание: union с фиксированным размером 32 байта.
+
+--- RIGID BODY ---
+
+RigidBody:
+    body_type:      BodyType
+    shape:          CollisionShape
+    mass:           f32
+    inv_mass:       f32
+    inertia:        [f32; 9]       # mat3
+    inv_inertia:    [f32; 9]
+    material_id:    u32
+    sleeping:       bool
+
+--- INTEGRATOR CONFIG ---
+
+IntegratorConfig:
+    dt_physics:         f32         # 0.01 (100 Гц) — базовый шаг физики
+    substeps:           u32         # 4-8 подшагов на тик
+    solver_iterations:  u32         # 5-10 XPBD итераций на substep
+    gravity:            [f32; 3]   # (0, -9.81, 0)
+    linear_damping:     f32         # 0.999
+    angular_damping:    f32         # 0.995
+    sleep_threshold:    f32         # 0.01
+    sleep_frames:       u32         # 60
+
+--- CONSTRAINT BATCH (GPU-ready, SoA) ---
+
+ConstraintBatch:
+    constraint_type:    Vec<u32>       # Distance=0, Hinge=1, Ball=2,
+                                       # Contact=3, Muscle=4
+    body_a:             Vec<u32>
+    body_b:             Vec<u32>
+    rest_value:         Vec<f32>       # rest length / rest angle
+    lambda:             Vec<f32>       # множители Лагранжа (warm start)
+    compliance:         Vec<f32>      # податливость (XPBD)
+    local_pos_a:        Vec<[f32; 3]>
+    local_pos_b:        Vec<[f32; 3]>
+    # Для Hinge:
+    local_axis_a:       Vec<[f32; 3]>
+    local_axis_b:       Vec<[f32; 3]>
+    angle_min:          Vec<f32>
+    angle_max:          Vec<f32>
+    # Для Muscle:
+    current_activation: Vec<f32>       # [0, 1] от нейросети
+    max_force:          Vec<f32>
+    rest_length_min:    Vec<f32>
+    rest_length_max:    Vec<f32>
+
+--- CONTACT POINT ---
+
+ContactPoint:
+    position:           [f32; 3]
+    normal:             [f32; 3]
+    penetration:        f32
+    impulse_normal:     f32
+    impulse_tangent:    [f32; 2]
+    contact_id:         u64
+
+--- CONTACT MANIFOLD ---
+
+ContactManifold:
+    entity_a:           u64
+    entity_b:           u64
+    contacts:           SmallVec<[ContactPoint; 4]>
+    age:                u32
+    material_pair:      (u32, u32)
+
+--- CREATURE INSTANCE ---
+
+CreatureInstance:
+    root_entity:        u64
+    body_parts:         Vec<u64>        # все EntityId частей тела
+    joints:             Vec<u64>        # EntityId суставов
+    muscles:            Vec<u64>        # EntityId мышц
+    sensors:            Vec<u64>        # EntityId сенсоров
+    brain_id:           Option<u64>     # ссылка на нейросеть (Aevum)
+
+--- MATERIAL ---
+
+Material:
+    name:               String
+    static_friction:    f32
+    dynamic_friction:   f32
+    restitution:        f32
+    density:            f32
+    compliance:         f32         # 0 = жёсткий, >0 = мягкий
+    color:              [f32; 4]
+    roughness:          f32
+    metallic:           f32
+    # Физические:
+    damage_threshold:   f32         # минимальный impulse для повреждения
+    damage_multiplier:  f32
+    deformation:        f32         # 0 = жёсткий, 1 = полностью мягкий
+    # Сенсорные:
+    sound_absorption:   f32         # 0 = отражает, 1 = поглощает
+    thermal_conductivity: f32
+    # Событийные:
+    burn_rate:          f32         # 0 = не горит, 1 = отлично горит
+    melt_point:         f32         # температура плавления (K), 0 = не плавится
+
+--- SENSOR ---
+
+SensorType:
+    Vision          = 0
+    Hearing         = 1
+    Smell           = 2
+    Touch           = 3
+    Proprioception  = 4
+    Electro         = 5    # опционально
+    Magneto         = 6    # опционально
+
+Sensor:
+    sensor_type:    SensorType
+    entity_id:      u64             # к какому телу привязан
+    parent_entity:  u64             # часть тела
+    local_position: [f32; 3]
+    local_rotation: [f32; 4]
+    # Vision:
+    fov:            f32
+    resolution:     [u32; 2]
+    max_distance:   f32
+    # Hearing:
+    hearing_radius: f32
+    frequency_buckets: u32
+    # Smell:
+    smell_radius:   f32
+    chemical_dim:   u32             # размерность chemical_signature
+    # Touch:
+    contact_threshold: f32
+
+--- SENSOR DATA (выход сенсора, подаётся в нейросеть) ---
+
+SensorData:
+    Vision(VisionData),
+    Hearing(HearingData),
+    Smell(SmellData),
+    Touch(TouchData),
+    Proprioception(ProprioceptionData),
+
+VisionData:
+    rgb_tensor:     [f32; W*H*3]   # [0, 1], с шумом
+    # W, H = resolution сенсора (32×32 = 3072 чисел)
+
+HearingData:
+    intensity:      f32
+    direction:      [f32; 3]        # направление на источник (с шумом)
+    spectrum:       [f32; N]        # частотные полосы (N = frequency_buckets)
+
+SmellData:
+    concentrations: [f32; D]        # D = chemical_dim (16 по умолчанию)
+
+TouchData:
+    force:          f32
+    normal:         [f32; 3]
+    friction:       [f32; 2]
+    material_id:    f32             # нормализованный
+    temperature:    f32
+
+ProprioceptionData:
+    joint_angles:       Vec<f32>    # углы всех суставов
+    joint_velocities:   Vec<f32>
+    joint_torques:      Vec<f32>
+    muscle_activations: Vec<f32>
+    muscle_tensions:    Vec<f32>
+    imu_acc:            [f32; 3]
+    imu_gyro:           [f32; 3]
+    energy_level:       f32
+    damage_level:       f32
+    body_temperature:   f32
+
+--- HEALTH ---
+
+Health:
+    max_health:     f32
+    current_health: f32
+    invulnerable:   bool
+
+DamageEvent:
+    target:         u64
+    source:         Option<u64>
+    amount:         f32
+    impulse:        f32
+    contact_point:  [f32; 3]
+    damage_type:    DamageType
+
+DamageType:
+    Impact,          # столкновение
+    Fall,            # падение с высоты
+    Crush,           # раздавливание
+    Fire,            # огонь
+    Freeze,          # холод
+    Disease,         # болезнь
+    Starvation,      # голод
+    Age              # старение
+
+--- DISEASE (СИСТЕМНАЯ, БЕЗ ПРЯМОЙ ЛЕТАЛЬНОСТИ) ---
+
+Disease:
+    disease_id:         u64
+    name:               String
+    
+    # Распространение
+    transmission:       TransmissionType
+    infection_radius:   f32         # для airborne/contact
+    infection_prob:     f32         # вероятность заражения при контакте
+    incubation_ticks:   u32         # скрытый период
+    
+    # Симптомы (ВСЕ опциональны, комбинируются)
+    symptoms:           Vec<Symptom>
+    
+    # Длительность
+    duration_min:       u32         # минимальная длительность (тиков)
+    duration_max:       u32         # максимальная
+    
+    # Мутации
+    mutation_prob:      f32         # вероятность мутации при передаче
+    mutation_mask:      u64         # какие симптомы могут мутировать
+
+TransmissionType:
+    Contact,            # прямой контакт существ
+    Airborne,           # воздух (через smell diffusion field!)
+    Waterborne,         # вода
+    Vector              # переносчик (другое существо)
+
+Symptom:
+    symptom_type:       SymptomType
+    intensity:          f32         # 0..1, сила симптома
+    progression_ticks:  u32         # за сколько тиков нарастает до полной силы
+
+SymptomType:
+    # СЕНСОРНЫЕ СИМПТОМЫ (добавляют шум)
+    VisionNoise,            # увеличивает σ шума в зрении
+    HearingNoise,           # увеличивает σ шума в слухе
+    SmellNoise,             # увеличивает σ шума в обонянии
+    TouchNoise,             # увеличивает σ шума в осязании
+    ProprioceptionNoise,    # увеличивает σ шума в проприоцепции
+    
+    VisionDistortion,       # хроматическая аберрация / blur
+    HearingLoss,            # снижение общей громкости
+    SmellLoss,              # снижение концентраций
+    
+    # МОТОРНЫЕ СИМПТОМЫ
+    MuscleWeakness,         # снижение max_force всех мышц
+    MuscleTremor,           # случайный шум в muscle_activation
+    MuscleDelay,            # задержка применения activation
+    CoordinationLoss,       # случайная инверсия сигналов (L/R путаница)
+    JointStiffness,         # увеличение stiffness суставов
+    
+    # МЕТАБОЛИЧЕСКИЕ СИМПТОМЫ
+    EnergyDrain,            # повышенный basal_metabolism
+    Fatigue,                # снижение max_velocity
+    TemperatureShift,       # отклонение body_temperature от нормы
+    
+    # КОГНИТИВНЫЕ (влияют на НЕЙРОСЕТЬ — для Aevum)
+    AttentionDeficit,       # случайный сброс saliency
+    MemoryImpairment,       # увеличение шума в replay buffer
+    Confusion,              # случайная замена L_t на шум
+
+--- INFECTION (состояние заражённого существа) ---
+
+Infection:
+    disease_id:         u64
+    infected_tick:      u64
+    symptoms_active:    bool                # прошёл ли инкубационный период
+    symptom_progress:   f32                 # 0..1 нарастание симптомов
+    current_intensity:  f32                 # текущая сила (0..1)
+    remaining_ticks:    u32                 # сколько осталось
+
+--- IMMUNE MEMORY (НЕ ПРЯМОЙ ИММУНИТЕТ, А АДАПТАЦИЯ) ---
+
+ImmuneMemory:
+    # Для каждого disease_id — опыт прошлых заражений
+    entries:            Vec<ImmuneEntry>
+
+ImmuneEntry:
+    disease_id:         u64
+    symptom_signature:  Vec<(SymptomType, f32)>  # какие симптомы были и их сила
+    exposure_count:     u32                 # сколько раз болели
+    last_exposure_tick: u64
+    # ЭФФЕКТ: нейросеть может научиться компенсировать
+    # (например, при повторной VisionNoise — больше полагаться на слух)
+    # Это НЕ хардкодный бонус, а результат обучения Aevum.
+
+--- DISEASE MUTATION ---
+
+DiseaseMutation:
+    # При передаче disease может мутировать:
+    # 1. Изменить intensity существующего симптома (±20%)
+    # 2. Добавить новый symptom из mutation_mask
+    # 3. Объединить симптомы от двух болезней (рекомбинация)
+    # Результат: новый disease_id с новой комбинацией симптомов
+
+--- CLIMATE STATE ---
+
+ClimateState:
+    temperature:        Grid2D<f32>     # K
+    humidity:           Grid2D<f32>     # 0..1
+    pressure:           Grid2D<f32>     # Pa
+    wind:               Grid2D<[f32; 2]> # (dx, dz)
+    cloud_density:      Grid2D<f32>     # 0..1
+    precipitation:      Grid2D<f32>     # интенсивность
+    light_level:        f32             # 0..1, глобально
+
+--- SEASON STATE ---
+
+SeasonState:
+    current_season:     Season          # Spring, Summer, Autumn, Winter
+    season_progress:    f32             # 0..1 в пределах сезона
+    day_cycle_ticks:    u32             # длительность полного цикла день/ночь
+    day_progress:       f32             # 0..1 в пределах дня
+    temperature_offset: f32             # сезонная добавка к температуре
+    precipitation_mul:  f32             # сезонный множитель осадков
+
+Season:
+    Spring, Summer, Autumn, Winter
+
+--- TERRAIN CHUNK ---
+
+TerrainChunk:
+    chunk_x:            i32
+    chunk_z:            i32
+    heights:            [[f32; 64]; 64]     # 64×64 heightfield
+    normals:            [[[f32; 3]; 64]; 64]
+    material_ids:       [[u8; 64]; 64]      # ID материала поверхности
+    biome_id:           u8
+    objects:            Vec<ChunkObject>    # деревья, камни (статика)
+
+--- WATER CHUNK ---
+
+WaterChunk:
+    chunk_x:            i32
+    chunk_z:            i32
+    water_height:       [[f32; 32]; 32]     # 32×32 (в 2 раза грубее terrain)
+    velocity_x:         [[f32; 32]; 32]
+    velocity_z:         [[f32; 32]; 32]
+
+--- SMELL FIELD ---
+
+SmellField:
+    # Хранится как текстура на GPU
+    chemical_grids:     Vec<GpuTexture2D>    # по одной текстуре на chemical_dim
+    resolution:         (u32, u32)           # размер grid
+    decay_rates:        Vec<f32>             # для каждого chemical
+
+--- EVENT ---
+
+Event:
+    Collision       { entity_a: u64, entity_b: u64, impulse: f32, point: [f32; 3] }
+    Spawn           { entity_id: u64, archetype_tag: u32 }
+    Destroy         { entity_id: u64 }
+    Damage          { target: u64, source: Option<u64>, amount: f32, damage_type: u32 }
+    Sound           { position: [f32; 3], intensity: f32, spectrum: [f32; 8] }
+    SmellSource     { position: [f32; 3], chemical: [f32; 16], intensity: f32 }
+    WildfireStart   { position: [f32; 3], intensity: f32 }
+    EarthquakeStart { position: [f32; 3], intensity: f32, duration: u32 }
+    FloodStart      { position: [f32; 3], water_rise: f32 }
+    StormStart      { position: [f32; 3], intensity: f32, path: Vec<[f32; 3]> }
+    DiseaseOutbreak { position: [f32; 3], disease_id: u64 }
+    UserMark        { tick: u64, label: String }
+
+--- SNAPSHOT (stable binary schema) ---
+
+Snapshot:
+    tick:               u64
+    random_state:       [u64; 4]
+    season_state:       SeasonState
+    entities:           Vec<SnapshotEntity>
+
+SnapshotEntity:
+    entity_id:          u64
+    archetype_tag:      u32
+    body_type:          u8
+    position:           [f32; 3]
+    rotation:           [f32; 4]
+    velocity:           [f32; 3]
+    angular_velocity:   [f32; 3]
+    mass:               f32
+    material_id:        u32
+    shape:              CollisionShape
+    health:             Option<f32>
+    infection:          Option<InfectionSnapshot>
+
+###############################################################################
+GPU ↔ CPU DATA FLOW (TRIPLE BUFFERING)
+###############################################################################
+
+Три буфера: BUFFER_A, BUFFER_B, BUFFER_C
+
+Frame N:
+    GPU Compute: пишет результат в BUFFER_A
+    GPU Render:  читает BUFFER_B (результат кадра N-1)
+    CPU Reader:  асинхронно читает BUFFER_C (результат кадра N-2)
+
+Frame N+1:
+    GPU Compute: BUFFER_B
+    GPU Render:  BUFFER_C
+    CPU Reader:  BUFFER_A
+
+Правила:
+    1. GPU никогда не ждёт CPU (fence-based синхронизация)
+    2. CPU reader — отдельный поток, только опрашивает fence
+    3. Если данные не готовы — CPU использует предыдущий кадр
+    4. Для физики с субстеппингом задержка в 2 кадра незаметна
+
+Данные GPU → CPU:
+    - Статистика коллизий (количество, типы)
+    - Данные сенсоров существ (VisionData, HearingData, SmellData)
+    - Профилировочные тайминги (GPU query pool)
+    - События (Event)
+
+Что остаётся на GPU:
+    - Позиции, скорости, трансформации
+    - Рендер читает напрямую из GPU-буферов физики (без roundtrip)
+    - SmellField (diffusion grid)
+    - ClimateState (температура, влажность, ветер)
+
+###############################################################################
+СИСТЕМНЫЙ ПАЙПЛАЙН (ОДИН ФИЗИЧЕСКИЙ ТИК)
+###############################################################################
+
+Stage::PrePhysics:
+    ClearForces             (w: Force, Torque)
+    TickCounter             (w: TickData)
+    ClimateUpdate           (w: ClimateState)        # раз в N тиков
+    SeasonUpdate            (w: SeasonState)         # каждый тик
+    DiseaseUpdate           (r: Infection, w: Health, SensorData)
+    EventTriggerCheck       (r: World) → Event[]
+
+Stage::Physics (повторяется substeps раз):
+    Gravity                 (r: Mass, w: Force)
+    Broadphase              (r: Position, w: SpatialHashGrid)
+    Narrowphase             (r: SpatialHashGrid, w: ContactManifold[])
+    XPBD Solve              (r: Position, Mass, w: ConstraintBatch)
+      - Contact constraints
+      - Joint constraints
+      - Muscle constraints
+    IntegrateForces         (r: Force, Mass, w: Velocity)
+    IntegrateVelocities     (r: Velocity, w: Position)
+    UpdateSleepState        (r: Velocity, w: Sleeping)
+    DamageCalculation       (r: ContactManifold, w: Health)
+
+Stage::PostPhysics:
+    UpdateAABB              (r: Position, CollisionShape, w: AABB)
+    SensorUpdate            (r: World, w: SensorData)  # Vision, Hearing, Smell, Touch, Proprio
+    SmellFieldUpdate        (r: SmellSource[], ClimateState, w: SmellField)
+    WaterUpdate             (r: WaterChunk[], ClimateState, w: WaterChunk[])
+    UpdateHotRing           (w: HotRingBuffer)
+    EventProcessing         (r: Event[]) → модификация мира
+
+Stage::Render:
+    UploadTransforms        (r: Position, Rotation, w: GPU buffers)
+    DebugDrawOverlays       (r: AABB, Velocity, Force, Skeleton, w: GPU line buffers)
+    RenderFrame             (r: GPU buffers)
+    RenderUI                (egui: панели, инспектор)
+
+Stage::Events:
+    MergeEventBuffers       # per-thread → global
+    ProcessTriggers         # EventDetector'ы → Recorder
+
+###############################################################################
+ВИЗУАЛИЗАЦИЯ: ТРИ СЛОЯ
+###############################################################################
+
+--- СЛОЙ 0: ФИЗИЧЕСКИЙ РЕНДЕР (всегда) ---
+    - Instanced rendering: ОДИН draw call на тип геометрии
+      (сферы, боксы, капсулы, цилиндры)
+    - Ground plane / terrain: heightfield с текстурой по биому
+    - Вода: полупрозрачная плоскость
+    - Цвета:
+      - Static: серый
+      - Dynamic: белый
+      - Kinematic: синий
+      - Существа: зелёный (здоров), красный (повреждён), жёлтый (болен)
+      - Растения: оттенки зелёного по высоте
+    - GPU-буфер трансформаций обновляется напрямую из физики (без копирования)
+
+--- СЛОЙ 1: ОТЛАДОЧНЫЕ ОВЕРЛЕИ (toggle по клавишам) ---
+    Key 1: Векторы скоростей (синий→белый: медленно→быстро)
+    Key 2: Векторы сил (красный: внешние, зелёный: мышцы)
+    Key 3: AABB боксы (полупрозрачные)
+    Key 4: Контакты (оранжевые точки + жёлтые нормали)
+    Key 5: Скелет существ (кости — линии, суставы — сферы)
+    Key 6: Мышцы (красный=напряжена, синий=расслаблена)
+    Key 7: Сенсорные поля (конусы зрения, радиусы слуха/обоняния)
+    Key 8: Энергия существ (зелёный→красный: много→мало)
+    Key 9: Болезни (фиолетовая аура вокруг заражённых)
+    Key 0: SmellField (тепловая карта chemical концентраций)
+
+    Все оверлеи рисуются как LineList/PointList в ОДНОМ батче.
+
+--- СЛОЙ 2: UI (egui, всегда поверх) ---
+
+    ВЕРХНЯЯ ПАНЕЛЬ:
+        [Tick: 123456] [FPS: 420] [Frame: 2.3ms]
+        [Freeze: ON/OFF] [Speed: 0.5x/1x/2x]
+        [Play] [Pause] [Step] [Record •]
+        [Season: Summer] [Day: 14:32] [Weather: Rain]
+
+    БОКОВАЯ ПАНЕЛЬ (вкладки):
+        - Stats: entity_count, archetype_count, memory, profiler timings
+        - World: temperature, humidity, wind, active_chunks
+        - Events: лента последних событий
+        - Agents: список всех агентов (здоров/болен/мёртв)
+        - Diseases: список активных болезней, мутации
+
+    ENTITY INSPECTOR (при клике на объект):
+        Entity #4242 "Agent_Alpha"
+        ├─ Position: (12.3, 0.5, -45.2)
+        ├─ Velocity: (0.1, 0.0, 0.8) m/s
+        ├─ BodyType: Dynamic
+        ├─ Mass: 10.0 kg
+        ├─ Shape: Capsule(radius=0.3, half_height=0.8)
+        ├─ Material: flesh
+        ├─ Health: 85/100
+        ├─ Infection: Flu (progress: 60%, symptoms: MuscleWeakness, VisionNoise)
+        ├─ Immune Memory: Flu(2x), Cold(1x)
+        ├─ Energy: 67%
+        └─ [Freeze] [Follow] [Delete]
+
+    НИЖНЯЯ ПАНЕЛЬ (Timeline):
+        [◀◀] [◀] [▶] [▶▶]  Tick: 123456/500000
+        [▮▮▮▯▯▯▯▯▯▯▯▯▯▯▯]
+        Зелёные отметки: событийные снапшоты
+        Красные отметки: аномалии
+        Фиолетовые: вспышки болезней
+
+--- РЕЖИМЫ КАМЕРЫ ---
+    FreeFly:      WASD + мышь, свободный полёт
+    Orbit:        вращение вокруг выбранного объекта
+    FirstPerson:  вид от первого лица существа
+    SensorView:   сырые данные сенсоров существа (визуализация VisionData и т.д.)
+    TopDown:      вид сверху
+    ClimateView:  тепловая карта температуры/влажности/ветра
+
+    УПРАВЛЕНИЕ:
+        TAB             — цикл по режимам камеры
+        1-0             — toggle оверлеев
+        ЛКМ             — выбрать объект (raycast по AABB)
+        F               — фокус на выбранном (Orbit)
+        G               — вселиться в существо (FirstPerson)
+        V               — сенсоры существа (SensorView)
+        C               — climate view
+        Пробел          — freeze/unfreeze
+        Стрелка вправо  — step_once
+        Ctrl+1..9       — сохранить позицию камеры
+        1..9            — телепорт к сохранённой позиции
+
+###############################################################################
+ВСТРОЕННЫЙ ПРОФИЛЕР
+###############################################################################
+
+ProfilableSystem:
+    name:               &'static str
+    cpu_timer:          CpuTimer
+    gpu_timer:          Option<GpuTimer>
+    call_count:         u64
+    total_time_us:      u64
+    max_time_us:        u64
+    min_time_us:        u64
+
+PerFrameReport:
+    tick:               u64
+    systems:            Vec<SystemTiming>
+    entity_count:       u32
+    archetype_count:    u32
+    memory_usage_mb:    f32
+    hot_ring_usage_mb:  f32
+    active_chunks:      u32
+    contact_count:      u32
+    constraint_count:   u32
+    sensor_count:       u32
+
+###############################################################################
+RECORD / REPLAY СИСТЕМА (ТРЁХУРОВНЕВАЯ)
+###############################################################################
+
+--- УРОВЕНЬ 1: HOT RING BUFFER (всегда активен) ---
+    Последние K=1000 тиков в памяти как дельты.
+    Оверхед: ~2-5 МБ на 100k сфер.
+    API:
+        sim.seek_tick(-50)   # мгновенно
+        sim.seek_tick(-1)
+
+--- УРОВЕНЬ 2: EVENT-TRIGGERED SNAPSHOTS ---
+    Детекторы работают каждый тик. При событии → снапшот на диск.
+    API:
+        sim.list_events()
+        sim.seek_event(5)
+        sim.add_user_mark("interesting")
+
+--- УРОВЕНЬ 3: DETERMINISTIC REPLAY ---
+    Только seed + начальное состояние + inputs.
+    Любой тик пересчитывается с нуля побитово.
+    API:
+        sim.save_deterministic_state("seed.sim")
+        sim.replay_to_tick(77777)
+
+###############################################################################
+PYTHON BRIDGE (PyO3 API)
+###############################################################################
+
+#[pymodule]
+sim_core:
+
+class Simulation:
+    __init__(mode: str = "headless" | "windowed")
+
+    # --- УПРАВЛЕНИЕ ЖИЗНЬЮ ---
+    spawn_sphere(pos, radius, mass, material="default") -> u64
+    spawn_box(pos, half_extents, mass, material="default") -> u64
+    spawn_capsule(pos, radius, half_height, mass, material="default") -> u64
+    spawn_creature(json_path: str) -> u64
+    spawn_terrain(config_path: str)
+    spawn_water(initial_height: f32)
+    despawn(entity_id: u64)
+    set_body_type(entity_id: u64, body_type: str)
+    set_position(entity_id: u64, pos: [f32; 3])
+
+    # --- ЗАПУСК ---
+    step(dt: f32) -> ProfilerReport
+    run_ticks(count: u32, dt: f32) -> ProfilerReport
+    run_headless_benchmark(ticks: u32, spheres: u32) -> dict
+
+    # --- FREEZE / STEP ---
+    freeze()
+    unfreeze()
+    step_once(dt: f32) -> ProfilerReport
+    is_frozen() -> bool
+
+    # --- RECORD / REPLAY ---
+    start_recording(mode: str)
+    stop_recording()
+    save_recording(path: str)
+    load_recording(path: str)
+    seek_tick(tick: u64)
+    seek_tick_relative(offset: i64)
+    seek_event(event_index: u32)
+    get_current_tick() -> u64
+    list_events() -> list[dict]
+    add_user_mark(label: str)
+
+    # --- DETERMINISTIC ---
+    save_deterministic_state(path: str)
+    load_deterministic_state(path: str)
+    replay_to_tick(target_tick: u64)
+
+    # --- ДАННЫЕ (numpy view без копирования) ---
+    get_positions() -> numpy.Array[f32; N, 3]
+    get_velocities() -> numpy.Array[f32; N, 3]
+    get_entity_ids() -> numpy.Array[u64; N]
+    get_entity_count() -> u32
+    get_sensor_data(entity_id: u64, sensor_type: str) -> numpy.Array
+
+    # --- ПРОФИЛИРОВАНИЕ ---
+    get_last_report() -> dict
+
+    # --- ОТЛАДКА ---
+    get_entity_info(entity_id: u64) -> dict
+    get_world_stats() -> dict
+    raycast(origin, direction) -> Option[dict]
+    set_gravity(gravity: [f32; 3])
+    set_substeps(substeps: u32)
+
+    # --- МАТЕРИАЛЫ ---
+    load_materials(path: str)
+    get_material(name: str) -> dict
+    list_materials() -> list[str]
+
+    # --- МИР ---
+    get_climate_at(pos: [f32; 3]) -> dict
+    set_season(season: str)
+    set_time_of_day(hour: f32)
+    spawn_event(event_type: str, position: [f32; 3], intensity: f32)
+
+    # --- БОЛЕЗНИ ---
+    spawn_disease(disease_config_path: str, position: [f32; 3])
+    list_active_diseases() -> list[dict]
+    infect_entity(entity_id: u64, disease_id: u64)
+
+    # --- КАМЕРА ---
+    set_camera_mode(mode: str)
+    set_camera_target(entity_id: u64)
+    get_camera_state() -> dict
+
+###############################################################################
+ЭТАП 1: ЯДРО + ПУСТАЯ СЦЕНА (v3.0)
+###############################################################################
+
+КЛЮЧЕВАЯ МЕТРИКА: 100 000 сфер @ 300+ FPS (windowed), 2000+ FPS (headless).
+
+Задачи Этапа 1:
+    - ECS ядро (Archetype, World, EntityId, запросы)
+    - Компоненты: Position, Rotation, Velocity, RigidBody, AABB
+    - Системы: Gravity, Integrate (semi-implicit Euler), ClearForces
+    - Планировщик: Stage pipeline, thread pool
+    - Визуализатор: wgpu, instanced rendering, flycam
+    - UI: egui верхняя панель, Entity Inspector
+    - Профилер: CPU таймеры, per-frame отчёт
+    - Record/Replay: Hot Ring, Event-Triggered Snapshots, Deterministic
+    - Python Bridge: PyO3, numpy view без копирования
+    - Тесты: свободное падение, детерминизм, 100k сфер стабильно
+
+ЧТО НЕ ВХОДИТ: коллизии, существа, сенсоры, мир, события, болезни.
+
+###############################################################################
+ЭТАП 2: ФИЗИКА + ТЕЛА СУЩЕСТВ
+###############################################################################
+
+2.1 BROADPHASE — SPATIAL HASH GRID (GPU)
+    - Ячейки фиксированного размера (1 метр)
+    - Radix sort пар (entity_id, cell_hash)
+    - Prefix sum для cell_offsets
+    - Проверка только внутри ячейки и 26 соседних
+    - Цель: 10 мкс на 100k объектов
+
+2.2 NARROWPHASE — GJK/EPA
+    - GJK: проверка пересечения выпуклых форм (Sphere, Box, Capsule, Cylinder, ConvexHull)
+    - EPA: penetration_depth, contact_normal, contact_point
+    - Warm start: кэширование симплекса GJK
+    - До 4 контактных точек на пару
+
+2.3 CONTACT MANAGER — PERSISTENT MANIFOLDS
+    - ContactPoint: position, normal, penetration, accumulated_impulse
+    - Feature-based matching между тиками (contact_id)
+    - Трение: кулоновская модель (clamp tangent_impulse по friction_limit)
+    - Warm start: накопленные импульсы
+
+2.4 XPBD SOLVER
+    - ConstraintBatch: SoA, GPU-ready
+    - Типы ограничений: Distance, Hinge, Ball, Contact, Muscle
+    - Compliance вместо жёсткости → стабильность
+    - 5-10 итераций на substep
+    - 4-8 substeps на физический тик
+
+2.5 MATERIAL SYSTEM
+    - Material: friction, density, restitution, compliance, damage_threshold,
+      damage_multiplier, deformation, sound_absorption, burn_rate, thermal_conductivity
+    - Загрузка из YAML
+    - Pair cache для контактных свойств
+    - Влияние на: коллизии, повреждения, звук, огонь, температуру
+
+2.6 CREATURE BUILDER
+    - build_from_json(path) → CreatureInstance
+    - Части тела: Sphere, Capsule, Box
+    - Суставы: Hinge (колено, локоть), Ball (плечо, бедро)
+    - Мышцы: XPBD distance constraint с переменной rest_length
+    - Рекурсивное построение иерархии
+
+2.7 MUSCLE SYSTEM
+    - rest_length = lerp(max, min, activation)
+    - activation: [0, 1] от нейросети
+    - max_force: предельная сила
+    - ТОЛЬКО тянет (однонаправленная)
+    - Пассивное сопротивление при растяжении
+
+2.8 STABILITY GUARANTEES
+    - NO FOOT SLIPPING: высокое трение стоп + warm start
+    - NO JOINT JITTER: XPBD compliance + substeps
+    - NO CONSTRAINT EXPLOSION: ограниченные итерации + warm start
+    - NO ENERGY INJECTION: damping + energy audit
+    - NO TUNNELING: CCD + спекулятивные контакты
+    - Тесты: существо стоит 10 000 тиков без дрифта
+
+###############################################################################
+ЭТАП 3: РЕАЛИСТИЧНЫЙ МИР
+###############################################################################
+
+3.1 TERRAIN
+    - Heightfield: Perlin/Simplex noise, multiple octaves
+    - Биомы по высоте и влажности: ocean, beach, grassland, hills, mountains, snow
+    - Билинейная интерполяция высоты
+    - Нормали из градиента
+    - LOD: дальние чанки грубее
+    - Streaming: загрузка/выгрузка чанков
+
+3.2 WATER (SHALLOW WATER)
+    - Height-field представление
+    - Уравнения мелкой воды: dh/dt, du/dt, dv/dt
+    - Semi-Lagrangian advection
+    - Плавучесть: F = density * submerged_volume * g
+    - Сопротивление: F_drag
+    - Визуализация: полупрозрачная плоскость + нормали
+
+3.3 CLIMATE
+    - Поля: temperature, humidity, pressure, wind, cloud, precipitation
+    - Диффузия + солнечный нагрев + adiabatic cooling
+    - Wind: градиент давления + Кориолис
+    - Обновление раз в 10-100 тиков (GPU compute)
+
+3.4 WEATHER
+    - Облака: конденсация при saturation
+    - Дождь: precipitation > порога
+    - Снег: precipitation + temperature < 273 K
+    - Влияние на: видимость, звук, запахи, огонь
+
+3.5 SEASONS
+    - Цикл: Spring → Summer → Autumn → Winter
+    - Длительность: 2 160 000 тиков на сезон (~6 часов реального времени)
+    - Влияние: temperature_offset, day_length, precipitation_mul
+
+3.6 WORLD STREAMING
+    - Активные чанки: N×N вокруг камеры/существ
+    - Чанк: 64×64 метров, terrain + water + objects + creatures
+    - Подгрузка по мере движения фокуса
+    - Выгрузка: сериализация → освобождение памяти
+
+###############################################################################
+ЭТАП 4: СЕНСОРЫ
+###############################################################################
+
+4.1 VISION (RGB КАМЕРА)
+    - GPU render-to-texture для каждого глаза
+    - Resolution: 32×32 (можно 64×64)
+    - FOV: 1.2 радиан (~70°)
+    - max_distance: 50 м
+    - Шум:
+      - Гауссов шум: σ = 0.02 + 0.05 * (1 - light_level)
+      - Motion blur при быстром движении
+      - Атмосферное затухание (туман, дождь, снег)
+      - + дополнительные шумы от болезней
+    - Выход: RGB тензор [32, 32, 3] float32 [0, 1]
+    - Оптимизация: групповой рендер всех глаз за один проход
+
+4.2 HEARING
+    - Источники: SoundEvent (шаги, столкновения, крики, гром)
+    - Затухание: intensity / (1 + distance² * attenuation)
+    - Окклюзия: raycast на препятствия → ×0.1
+    - Частотная фильтрация: высокие затухают быстрее
+    - Частотные полосы: 8 (настраивается)
+    - Шум: σ = 0.05, направленный шум ±5°
+    - Выход: [intensity, direction(3), spectrum(N)]
+
+4.3 SMELL
+    - Diffusion field на GPU (текстура)
+    - Chemical_signature: 16-мерный вектор
+    - Уравнение диффузии: dC/dt = D∇²C - decay*C + sources
+    - Адвекция ветром
+    - Шум: σ = 0.1 + 0.2 * wind_speed
+    - Выход: [f32; D] концентрации
+
+4.4 TOUCH
+    - Чтение ContactManifold для тела
+    - Данные: force, normal, friction, material_id, temperature
+    - Шум: σ = 0.01 * max_force
+    - Выход: [force, normal(3), friction(2), material_id, temperature]
+
+4.5 PROPRIOCEPTION
+    - Все углы суставов, угловые скорости, моменты
+    - Активация мышц, натяжение
+    - IMU: акселерометр, гироскоп (с дрейфом)
+    - Внутреннее: energy_level, damage_level, body_temperature
+    - Шум: σ = 0.01 на все значения
+
+4.6 ELECTRO / MAGNETO (опционально)
+    - Electro: электрические поля (мышцы, молнии), ~1/r²
+    - Magneto: магнитное поле Земли + аномалии
+
+###############################################################################
+ЭТАП 5: СЛУЧАЙНЫЕ СОБЫТИЯ
+###############################################################################
+
+ОБЩИЙ ПРИНЦИП: ВСЕ СОБЫТИЯ SYSTEMIC.
+Возникают из комбинации факторов среды. Никаких скриптов.
+
+5.1 EVENT SYSTEM
+    - Проверка условий каждый тик
+    - Интенсивность, радиус, длительность, эпицентр
+    - Влияние на мир через модификацию компонентов
+
+5.2 WILDFIRE
+    Условия:
+      - temperature > 300 K
+      - humidity < 0.3
+      - lightning_strike ИЛИ lava ИЛИ existing_fire
+      - fuel: burn_rate > 0
+    Распространение:
+      - По wind
+      - По fuel (burn_rate материала)
+      - В гору быстрее
+    Влияние:
+      - Уничтожение растительности
+      - Damage существам
+      - Smoke: smell source + vision obstruction
+      - Material: → ash (burn_rate=0)
+      - Регенерация через N тиков: ash → grass
+    Тушение:
+      - Дождь (precipitation > 0.5)
+      - Отсутствие fuel
+      - Вода
+
+5.3 EARTHQUAKE
+    Условия:
+      - Тектонические линии на карте
+      - Нарастающая вероятность
+    Эффект:
+      - Вибрация: синусоидальное смещение Static
+      - Амплитуда/частота от intensity
+      - Duration: 100-500 тиков
+    Влияние:
+      - Изменение terrain (оползни)
+      - Damage всем объектам
+      - Падение существ
+      - Афтершоки
+      - Триггер цунами (в океане)
+
+5.4 FLOOD
+    Условия:
+      - Длительные осадки
+      - Цунами (earthquake в океане)
+    Эффект:
+      - Подъём water_height
+      - Течение
+    Влияние:
+      - Затопление низменностей
+      - Гибель растительности
+      - Миграция или гибель существ
+      - Material: → mud
+
+5.5 STORM (УРАГАН)
+    Условия:
+      - Большой градиент температуры
+      - Высокая влажность
+      - Над океаном
+    Эффект:
+      - Экстремальный ветер (5-10×)
+      - Сильные осадки
+      - Движется по карте
+    Влияние:
+      - Силы на все объекты
+      - Разрушение структур
+      - Распространение запахов
+
+5.6 DROUGHT
+    Условия:
+      - Длительное отсутствие осадков
+      - Высокая температура
+    Эффект:
+      - humidity → 0.1
+      - water_height снижается
+      - water_deficit для растений
+    Влияние:
+      - Гибель растительности
+      - Повышенная вероятность пожаров
+      - Миграция существ
+
+5.7 VOLCANO (опционально)
+    - Стационарный источник
+    - Извержение: лава, пепел, пирокластические потоки
+    - Влияние: terrain changes, global cooling (пепел)
+
+5.8 DISEASE OUTBREAK
+    Условия:
+      - Высокая плотность существ
+      - Низкая температура (ослабленный иммунитет)
+      - Наличие disease в популяции
+    Эффект:
+      - Spawn Disease в регионе
+      - Распространение через transmission_type
+
+###############################################################################
+СИСТЕМА БОЛЕЗНЕЙ (ДЕТАЛЬНО)
+###############################################################################
+
+ПРИНЦИПЫ:
+    1. НЕТ ПРЯМОЙ ЛЕТАЛЬНОСТИ. Болезнь НЕ убивает напрямую.
+       Смерть — от голода (не смог добыть еду из-за симптомов),
+       падения (нарушение координации), хищника (не заметил).
+
+    2. ВЛИЯНИЕ ЧЕРЕЗ СЕНСОРЫ И МЫШЦЫ.
+       Симптомы добавляют шум, снижают силу, замедляют.
+
+    3. МУТАЦИИ. Болезни эволюционируют, комбинируют симптомы.
+
+    4. ИММУНИТЕТ — ЭТО АДАПТАЦИЯ МОЗГА.
+       Никаких "if immune: damage *= 0.5".
+       Мозг (Aevum) САМ учится компенсировать симптомы,
+       запоминая "при этой болезни я плохо вижу — больше полагаюсь на слух".
+
+--- DISEASE CONFIG (YAML) ---
+
+```yaml
+# config/diseases/common_cold.yaml
+disease:
+  name: "Common Cold"
+  transmission: airborne
+  infection_radius: 5.0
+  infection_prob: 0.3
+  incubation_ticks: 500
+  duration_min: 2000
+  duration_max: 5000
+  mutation_prob: 0.05
+  mutation_mask: [VisionNoise, HearingNoise, SmellLoss, MuscleWeakness]
+  symptoms:
+    - type: SmellLoss
+      intensity: 0.6
+      progression_ticks: 300
+    - type: EnergyDrain
+      intensity: 0.2
+      progression_ticks: 500
+    - type: Fatigue
+      intensity: 0.3
+      progression_ticks: 400
+
+# config/diseases/muscle_rot.yaml
+disease:
+  name: "Muscle Rot"
+  transmission: contact
+  infection_radius: 1.0
+  infection_prob: 0.5
+  incubation_ticks: 1000
+  duration_min: 5000
+  duration_max: 15000
+  mutation_prob: 0.1
+  mutation_mask: [MuscleWeakness, MuscleTremor, MuscleDelay, CoordinationLoss, JointStiffness]
+  symptoms:
+    - type: MuscleWeakness
+      intensity: 0.7
+      progression_ticks: 2000
+    - type: MuscleTremor
+      intensity: 0.4
+      progression_ticks: 1500
+    - type: JointStiffness
+      intensity: 0.3
+      progression_ticks: 3000
+
+# config/diseases/brain_fog.yaml
+disease:
+  name: "Brain Fog"
+  transmission: airborne
+  infection_radius: 3.0
+  infection_prob: 0.2
+  incubation_ticks: 2000
+  duration_min: 3000
+  duration_max: 8000
+  mutation_prob: 0.08
+  mutation_mask: [VisionNoise, HearingNoise, CoordinationLoss, AttentionDeficit, MemoryImpairment, Confusion]
+  symptoms:
+    - type: VisionNoise
+      intensity: 0.5
+      progression_ticks: 1000
+    - type: HearingNoise
+      intensity: 0.4
+      progression_ticks: 1000
+    - type: CoordinationLoss
+      intensity: 0.6
+      progression_ticks: 2000
+    - type: AttentionDeficit
+      intensity: 0.5
+      progression_ticks: 1500
+    - type: Confusion
+      intensity: 0.4
+      progression_ticks: 2000
+
+# config/diseases/compound_nightmare.yaml (пример мутировавшей)
+disease:
+  name: "Compound Nightmare"
+  # Образовалась мутацией из Common Cold + Brain Fog
+  transmission: airborne
+  infection_radius: 4.0
+  infection_prob: 0.4
+  incubation_ticks: 1500
+  duration_min: 4000
+  duration_max: 10000
+  mutation_prob: 0.15
+  mutation_mask: [VisionNoise, HearingNoise, SmellLoss, MuscleWeakness,
+                  MuscleTremor, CoordinationLoss, AttentionDeficit, Confusion]
+  symptoms:
+    - type: VisionNoise
+      intensity: 0.6
+      progression_ticks: 800
+    - type: HearingNoise
+      intensity: 0.5
+      progression_ticks: 800
+    - type: MuscleWeakness
+      intensity: 0.5
+      progression_ticks: 1200
+    - type: CoordinationLoss
+      intensity: 0.4
+      progression_ticks: 1000
+    - type: Confusion
+      intensity: 0.6
+      progression_ticks: 1500
+    - type: EnergyDrain
+      intensity: 0.3
+      progression_ticks: 500
+```
+
+--- DISEASE SYSTEM RUNTIME ---
+
+DiseaseSystem::update(world, dt):
+Для каждого заражённого существа:
+1. Если инкубационный период прошёл:
+symptom_progress += dt / progression_ticks  # нарастание 0→1
+current_intensity = symptom_progress * symptom.intensity
+2. Применить симптомы к сенсорам и мышцам:
+- VisionNoise: увеличить σ в VisionSensor
+- MuscleWeakness: умножить max_force всех мышц на (1 - intensity)
+- MuscleTremor: добавить random noise к activation
+- CoordinationLoss: случайная инверсия L/R активации
+- EnergyDrain: увеличить basal_metabolism
+- ... и т.д.
+3. Проверить duration: если remaining_ticks == 0 → выздоровление
+4. Сохранить в ImmuneMemory:
+- Какие симптомы были, их сила
+- НЕ даёт бонусов, только запись опыта
+
+DiseaseSystem::transmit(world):
+Для каждого заражённого:
+Если transmission == airborne:
+- Найти всех существ в infection_radius
+- Вероятность заражения = infection_prob * плотность
+Если transmission == contact:
+- Проверить ContactManifold с другими существами
+- При контакте: вероятность = infection_prob
+Если transmission == waterborne:
+- Проверить, находятся ли в одном водоёме
+При заражении:
+- Если есть mutation_prob: возможна мутация симптомов
+- Создать новый Infection с disease_id (возможно, новым)
+
+DiseaseSystem::mutate(parent_disease, world_rng):
+# При передаче:
+1. С вероятностью mutation_prob:
+a. Выбрать symptom из mutation_mask
+b. Изменить intensity на ±20% (clamp 0.1-1.0)
+c. ИЛИ добавить новый symptom из mutation_mask
+d. ИЛИ (если существо заражено двумя болезнями) —
+рекомбинировать симптомы от обеих
+2. Создать новый disease_id с новой комбинацией
+3. Записать в реестр болезней
+
+--- IMMUNE MEMORY (АДАПТАЦИЯ, НЕ ИММУНИТЕТ) ---
+
+ImmuneMemory НЕ изменяет параметры болезни напрямую.
+Это данные, которые ПОДАЮТСЯ В НЕЙРОСЕТЬ Aevum.
+
+При повторном заражении:
+- Aevum получает immune_memory как дополнительный вход:
+[disease_id, exposure_count, symptom_1_type, symptom_1_intensity, ...]
+- Мозг может:
+- Узнать знакомую болезнь по первым симптомам
+- Заранее усилить другие сенсоры (меньше полагаться на зрение)
+- Изменить стратегию движения (медленнее, осторожнее)
+- Искать убежище
+
+Это НЕ хардкод. Это обучение.
+При первой встрече с болезнью агент страдает.
+При повторной — знает, как компенсировать.
+
+###############################################################################
+КОНТРОЛЬНЫЕ ТОЧКИ (ВСЕ ЭТАПЫ)
+###############################################################################
+
+Checkpoint Alpha (Этап 1):
+ECS работает: spawn, despawn, query
+Гравитация: сферы падают с правильным ускорением
+Визуализация: окно, 100k сфер, 300+ FPS
+Record/Replay: все три уровня работают
+Python API: все методы доступны
+
+Checkpoint Beta (Этап 2):
+Коллизии работают: сферы НЕ проваливаются сквозь землю
+Трение: объекты останавливаются
+Существо из JSON создаётся
+Существо стоит 10 000 тиков без дрифта
+Мышцы сокращаются по сигналу
+Ходьба: стопы не скользят, суставы не дрожат
+
+Checkpoint Gamma (Этап 3):
+Terrain генерируется процедурно
+Вода течёт, объекты плавают
+Погода меняется: дождь, ветер, облака
+Сезоны сменяются
+Streaming: мир подгружается при движении камеры
+
+Checkpoint Delta (Этап 4):
+Существа видят RGB картинку (32×32)
+Слышат звуки с затуханием и окклюзией
+Чувствуют запахи по diffusion field
+Осязание: сила, направление, материал
+Проприоцепция: углы суставов, IMU
+Все сенсоры с шумом
+
+Checkpoint Epsilon (Этап 5):
+Пожар возникает от молнии в сухом лесу
+Пожар распространяется по ветру
+Землетрясение меняет terrain
+Наводнение затапливает низменности
+Болезнь распространяется airborne
+Болезнь мутирует при передаче
+Симптомы влияют на сенсоры и мышцы
+Существо с болезнью видит хуже, двигается слабее
+Иммунная память сохраняется (для Aevum)
+
+###############################################################################
+РЕШЕНИЯ ДЛЯ УЗКИХ МЕСТ
+###############################################################################
+
+Проблема: GPU → CPU transfer latency
+Решение: Triple buffering + CPU reader thread + tolerance to 2-frame latency
+
+Проблема: Angular constraints сложность
+Решение: Exp map tangent space + hinge-only first + постепенное усложнение
+
+Проблема: Friction instability
+Решение: Persistent contact manifolds + warm starting + cached tangent impulses
+
+Проблема: Snapshot layout changes
+Решение: Stable binary schema layer поверх ECS
+
+Проблема: Floating-point determinism
+Решение: Два режима: Fast и Deterministic
+
+Проблема: EventBus contention
+Решение: Per-thread local event buffers + merge
+
+Проблема: Chunk lookup overhead
+Решение: Sparse HashMap с Morton/Z-order ключами
+
+Проблема: Hot Ring память
+Решение: Дельта-компрессия + опциональная lossy compression
+
+Проблема: Deterministic replay производительность
+Решение: Комбинировать с Event-Triggered снапшотами как чекпоинтами
+
+Проблема: Vision sensor performance (много существ)
+Решение: Групповой рендер всех глаз за один проход GPU
+
+Проблема: Smell field память
+Решение: Только для активных чанков, разрешение 1/4 от terrain, GPU
+
+Проблема: Fire spread performance
+Решение: Клеточный автомат на GPU, обновление только горящих/соседних клеток
+
+Проблема: Disease tracking overhead
+Решение: Только для заражённых существ, ленивое обновление ImmuneMemory
+
+###############################################################################
+ФИНАЛЬНЫЕ ЗАМЕЧАНИЯ
+###############################################################################
+
+1. ЭТО НЕ ИГРОВОЙ ДВИЖОК.
+   Это вычислительный биом для эволюции. Визуализация — лишь окно.
+2. STABILITY FIRST.
+   Лучше 10 стабильных существ, чем 1000 дёргающихся.
+   XPBD + substeps + warm start — ключ к стабильности.
+3. NO CHEATING.
+   Сенсоры не получают прямую информацию. Болезни не убивают напрямую.
+   Мозг сам учится интерпретировать и компенсировать.
+4. SYSTEMIC, NOT SCRIPTED.
+   События возникают из среды, не из скриптов.
+   Пожар = температура + сухость + молния.
+5. TENSOR-FIRST.
+   Все данные сенсоров — тензоры на GPU.
+   Никаких копирований CPU↔GPU для neural pipeline.
+6. PROFILER FROM DAY ONE.
+   Без него оптимизация — гадание.
+7. RECORD/REPLAY — ИНФРАСТРУКТУРА.
+   Трёхуровневая система: Hot Ring (мгновенно), Event-Triggered (события),
+   Deterministic (побитово).
+8. DISEASES AS SENSOR/MUSCLE MODIFIERS.
+   Никаких "if lethal > random: die".
+   Только: зрение зашумлено, мышцы слабее, координация нарушена.
+   Смерть = последствия симптомов (голод, падение, хищник).
+9. IMMUNITY = BRAIN ADAPTATION.
+   Иммунная память — вход для нейросети Aevum.
+   Мозг учится компенсировать знакомые симптомы.
+10. 300 FPS НА 100K СФЕР — РЕАЛИСТИЧНАЯ ЦЕЛЬ.
+    Если фундамент не тянет это — всё остальное не взлетит.
+
+###############################################################################
+ГОТОВО К РЕАЛИЗАЦИИ
+###############################################################################
+
+```
