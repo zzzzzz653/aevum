@@ -215,21 +215,21 @@ impl<'a> Renderer<'a> {
         self.index_count = indices.len() as u32;
 
         // Vertex буфер
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let vertex_buffer = self.device.as_ref().unwrap().create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Sphere Vertex Buffer"),
             contents: bytemuck::cast_slice(&vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
 
         // Index буфер
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let index_buffer = self.device.as_ref().unwrap().create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Sphere Index Buffer"),
             contents: bytemuck::cast_slice(&indices),
             usage: wgpu::BufferUsages::INDEX,
         });
 
         // Instance буфер (будет обновляться каждый кадр)
-        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        let instance_buffer = self.device.as_ref().unwrap().create_buffer(&wgpu::BufferDescriptor {
             label: Some("Instance Buffer"),
             size: (100000 * std::mem::size_of::<InstanceData>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
@@ -237,7 +237,7 @@ impl<'a> Renderer<'a> {
         });
 
         // Camera uniform буфер
-        let camera_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        let camera_uniform_buffer = self.device.as_ref().unwrap().create_buffer(&wgpu::BufferDescriptor {
             label: Some("Camera Uniform Buffer"),
             size: std::mem::size_of::<CameraUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -245,7 +245,7 @@ impl<'a> Renderer<'a> {
         });
 
         // Layout для pipeline
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let bind_group_layout = self.device.as_ref().unwrap().create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Bind Group Layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
@@ -261,7 +261,7 @@ impl<'a> Renderer<'a> {
             ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = self.device.as_ref().unwrap().create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Bind Group"),
             layout: &bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
@@ -270,20 +270,20 @@ impl<'a> Renderer<'a> {
             }],
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        let pipeline_layout = self.device.as_ref().unwrap().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
 
         // Shader модуль
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader = self.device.as_ref().unwrap().create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Sphere Shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("sphere.wgsl"))),
         });
 
         // Render pipeline
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let pipeline = self.device.as_ref().unwrap().create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Sphere Render Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
@@ -430,7 +430,7 @@ impl<'a> Renderer<'a> {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        let mut encoder = self.device.as_ref().unwrap().create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
         });
 
