@@ -2,8 +2,9 @@
 
 use crate::world::World;
 use crate::components::transform::Position;
-use crate::components::physics::CollisionShape;
-use glam::{Vec3, Mat4};
+use crate::components::physics::{CollisionShape, RigidBody};
+use crate::components::collision::AABB;
+use glam::{Vec3, Mat4, Quat};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
@@ -366,6 +367,10 @@ impl<'a> Renderer<'a> {
         
         for arch in world.archetypes() {
             // Проверить, есть ли в архетипе Position и CollisionShape
+            if !arch.has_component::<Position>() || !arch.has_component::<CollisionShape>() {
+                continue;
+            }
+            
             let positions = arch.get_component_slice::<Position>();
             let shapes = arch.get_component_slice::<CollisionShape>();
             
@@ -378,7 +383,7 @@ impl<'a> Renderer<'a> {
                 
                 let model = Mat4::from_scale_rotation_translation(
                     Vec3::new(radius, radius, radius),
-                    glam::Quat::IDENTITY,
+                    Quat::IDENTITY,
                     Vec3::new(pos.x, pos.y, pos.z),
                 );
                 
