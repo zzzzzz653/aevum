@@ -17,13 +17,14 @@ pub fn integrate_motion(world: &mut World, dt: f32) {
             continue;
         }
         
+        let len = arch.len;
         let positions = arch.get_component_slice_mut::<Position>();
         let rotations = arch.get_component_slice_mut::<Rotation>();
         let velocities = arch.get_component_slice::<Velocity>();
         let angular_velocities = arch.get_component_slice::<AngularVelocity>();
         let rigid_bodies = arch.get_component_slice::<RigidBody>();
         
-        for i in 0..arch.len {
+        for i in 0..len {
             let rb = &rigid_bodies[i];
             
             // Пропустить статические тела

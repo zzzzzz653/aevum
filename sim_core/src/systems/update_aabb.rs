@@ -13,12 +13,13 @@ pub fn update_aabb(world: &mut World) {
             continue;
         }
         
+        let len = arch.len;
         let positions = arch.get_component_slice::<Position>();
         let rigid_bodies = arch.get_component_slice::<RigidBody>();
         
         // Добавляем компонент AABB если его нет
         if !arch.has_component::<AABB>() {
-            for i in 0..arch.len {
+            for i in 0..len {
                 let pos = [positions[i].x, positions[i].y, positions[i].z];
                 let rb = &rigid_bodies[i];
                 let aabb = compute_aabb(pos, &rb.shape);
@@ -26,7 +27,7 @@ pub fn update_aabb(world: &mut World) {
             }
         } else {
             let aabbs = arch.get_component_slice_mut::<AABB>();
-            for i in 0..arch.len {
+            for i in 0..len {
                 let pos = [positions[i].x, positions[i].y, positions[i].z];
                 let rb = &rigid_bodies[i];
                 aabbs[i] = compute_aabb(pos, &rb.shape);

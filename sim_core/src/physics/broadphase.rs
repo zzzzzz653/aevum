@@ -47,7 +47,7 @@ impl SpatialHashGrid {
     }
 
     /// Построить/grid из всех AABB
-    pub fn build(&mut self, entities: &[EntityId], aabbs: &[AABB]) {
+    pub fn build(&mut self, _entities: &[EntityId], aabbs: &[AABB]) {
         self.grid.clear();
         
         for (idx, aabb) in aabbs.iter().enumerate() {

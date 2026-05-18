@@ -1,9 +1,6 @@
 //! Рендерер — визуализация симуляции через wgpu + egui
 
 use crate::world::World;
-use crate::components::transform::Position;
-use crate::components::physics::{RigidBody, CollisionShape};
-use glam::Vec3;
 
 /// Конфигурация рендерера
 pub struct RenderConfig {
@@ -45,7 +42,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// Инициализировать wgpu
-    pub async fn initialize(&mut self, window: &winit::window::Window) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn initialize(&'a mut self, window: &'a winit::window::Window) -> Result<(), Box<dyn std::error::Error>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
@@ -109,11 +106,11 @@ impl<'a> Renderer<'a> {
     }
 
     /// Рендерить кадр
-    pub fn render(&mut self, world: &World) {
+    pub fn render(&mut self, _world: &World) {
         let Some(device) = &self.device else { return };
         let Some(queue) = &self.queue else { return };
         let Some(surface) = &self.surface else { return };
-        let Some(config) = &self.surface_config else { return };
+        let Some(_config) = &self.surface_config else { return };
 
         let frame = match surface.get_current_texture() {
             Ok(frame) => frame,
@@ -129,7 +126,7 @@ impl<'a> Renderer<'a> {
         });
 
         {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,

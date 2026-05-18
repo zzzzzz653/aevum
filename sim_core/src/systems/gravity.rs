@@ -8,9 +8,9 @@ use glam::Vec3;
 
 /// Применить гравитацию ко всем динамическим телам
 pub fn apply_gravity(world: &mut World, gravity: Vec3) {
-    let mut query = Query::default().with::<RigidBody>().with::<Velocity>().with::<Force>();
+    let query = Query::default().with::<RigidBody>().with::<Velocity>().with::<Force>();
     
-    for arch in world.archetypes() {
+    for arch in world.archetypes_mut() {
         // Проверить что архетип содержит нужные компоненты
         if !query.matches_archetype(arch) {
             continue;
