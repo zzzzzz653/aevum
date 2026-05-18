@@ -13,24 +13,46 @@ pub fn update_aabb(world: &mut World) {
             continue;
         }
         
-        let len = arch.len;
-        let positions = arch.get_component_slice::<Position>();
-        let rigid_bodies = arch.get_component_slice::<RigidBody>();
-        
         // Добавляем компонент AABB если его нет
         if !arch.has_component::<AABB>() {
-            for i in 0..len {
-                let pos = [positions[i].x, positions[i].y, positions[i].z];
-                let rb = &rigid_bodies[i];
-                let aabb = compute_aabb(pos, &rb.shape);
-                arch.add_component_by_index(i, aabb);
+            let mut new_aabbs: Vec<AABB> = Vec::new();
+            
+            // Шаг 1: Вычисляем новые AABB на основе позиций
+            {
+                let positions = arch.get_component_slice::<Position>();
+                let rigid_bodies = arch.get_component_slice::<RigidBody>();
+                for i in 0..arch.len {
+                    let pos = [positions[i].x, positions[i].y, positions[i].z];
+                    let rb = &rigid_bodies[i];
+                    let aabb = compute_aabb(pos, &rb.shape);
+                    new_aabbs.push(aabb);
+                }
+            } // Чтение завершено
+
+            // Шаг 2: Применяем новые AABB
+            for i in 0..arch.len {
+                arch.add_component_by_index(i, new_aabbs[i]);
             }
         } else {
-            let aabbs = arch.get_component_slice_mut::<AABB>();
-            for i in 0..len {
-                let pos = [positions[i].x, positions[i].y, positions[i].z];
-                let rb = &rigid_bodies[i];
-                aabbs[i] = compute_aabb(pos, &rb.shape);
+            let mut new_aabbs: Vec<AABB> = Vec::new();
+            
+            // Шаг 1: Вычисляем новые AABB на основе позиций
+            {
+                let positions = arch.get_component_slice::<Position>();
+                let rigid_bodies = arch.get_component_slice::<RigidBody>();
+                for i in 0..arch.len {
+                    let pos = [positions[i].x, positions[i].y, positions[i].z];
+                    let rb = &rigid_bodies[i];
+                    new_aabbs.push(compute_aabb(pos, &rb.shape));
+                }
+            } // Чтение завершено
+
+            // Шаг 2: Применяем новые AABB
+            {
+                let aabbs = arch.get_component_slice_mut::<AABB>();
+                for i in 0..arch.len {
+                    aabbs[i] = new_aabbs[i];
+                }
             }
         }
     }
