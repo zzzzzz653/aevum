@@ -1,16 +1,11 @@
 //! Точка входа — headless режим и визуализация
 
-use sim_core::world::World;
-use sim_core::scene::SceneSpawner;
-use sim_core::systems::{apply_gravity, integrate_motion, clear_forces, update_aabb};
-use sim_core::physics::{find_collision_pairs};
-use glam::Vec3;
+use sim_core::Simulation;
 
 #[cfg(feature = "visualizer")]
 mod visualizer_app {
-    use crate::world::World;
-    use crate::scene::SceneSpawner;
-    use crate::render::{Renderer, RenderConfig};
+    use sim_core::Simulation;
+    use sim_core::render::{Renderer, RenderConfig};
     use winit::{
         application::ApplicationHandler,
         event::WindowEvent,
@@ -20,21 +15,20 @@ mod visualizer_app {
     use std::sync::Arc;
 
     pub struct App<'a> {
-        world: World,
+        sim: Simulation,
         renderer: Option<Renderer<'a>>,
         window: Option<Arc<Window>>,
     }
 
     impl<'a> App<'a> {
         pub fn new() -> Self {
-            let mut world = World::new();
-            let mut spawner = SceneSpawner::new(&mut world);
-            spawner.spawn_ground(0.0);
-            spawner.spawn_sphere_grid(100, 0.5, 0.2, 1.0);
-            println!("Total entities: {}", world.entity_count());
+            let mut sim = Simulation::new();
+            sim.add_floor(0.0);
+            sim.add_sphere_grid(100, 2.0, 0.0, 5.0, 1.0);
+            println!("Total entities: {}", sim.entity_count());
             
             Self {
-                world,
+                sim,
                 renderer: None,
                 window: None,
             }
@@ -69,8 +63,8 @@ mod visualizer_app {
                 }
                 WindowEvent::RedrawRequested => {
                     if let Some(renderer) = &mut self.renderer {
-                        self.world.step(0.016);
-                        renderer.render(&self.world);
+                        self.sim.step(0.016);
+                        renderer.render(self.sim.get_world());
                         self.window.as_ref().unwrap().request_redraw();
                     }
                 }
@@ -101,54 +95,21 @@ fn main() {
     
     #[cfg(not(feature = "visualizer"))]
     {
-        println!("AEVUM Simulation Core");
-        println!("=====================");
+        println!("Running native sim_core benchmark...");
+        let mut sim = Simulation::new();
+
+        // Создадим немного объектов для теста
+        sim.add_floor(0.0);
+        sim.add_sphere_grid(10, 2.0, 0.0, 5.0, 1.0);
         
-        // Создать мир
-        let mut world = World::new();
-        
-        // Создать спавнер
-        let mut spawner = SceneSpawner::new(&mut world);
-        
-        // Спавн пола
-        spawner.spawn_ground(0.0);
-        
-        // Спавн тестовых сфер
-        println!("Spawning 1000 spheres...");
-        spawner.spawn_sphere_grid(1000, 2.5, 1.0, 1.0);
-        
-        println!("Total entities: {}", world.entity_count());
-        
-        // Главный цикл симуляции (headless тест)
-        let gravity = Vec3::new(0.0, -9.81, 0.0);
-        let dt = 0.01;
-        
-        println!("\nRunning simulation for 100 ticks...");
-        for tick in 0..100 {
-            // 1. Очистить силы
-            clear_forces(&mut world);
-            
-            // 2. Применить гравитацию
-            apply_gravity(&mut world, gravity);
-            
-            // 3. Интегрировать движение
-            integrate_motion(&mut world, dt);
-            
-            // 4. Обновить AABB
-            update_aabb(&mut world);
-            
-            // 5. Найти пары коллизий (для отладки)
-            let pairs = find_collision_pairs(&world);
-            
-            if tick % 10 == 0 {
-                println!("Tick {}: {} entities, {} collision pairs", 
-                         tick, world.entity_count(), pairs.len());
-            }
-            
-            world.step(dt);
+        let steps = 100;
+        let start = std::time::Instant::now();
+        for _ in 0..steps {
+            sim.step(0.016); // примерно 60 FPS
         }
+        let duration = start.elapsed();
         
-        println!("\nSimulation complete!");
-        println!("Final entity count: {}", world.entity_count());
+        println!("Entities: {}", sim.entity_count());
+        println!("Completed {} steps in {:.2?} (avg: {:.2?}/step)", steps, duration, duration / steps as u32);
     }
 }
