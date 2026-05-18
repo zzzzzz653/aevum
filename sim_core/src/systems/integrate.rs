@@ -72,12 +72,16 @@ pub fn integrate_motion(world: &mut World, dt: f32) {
         // Шаг 2: Применяем изменения, получая мутабельный доступ
         {
             let positions = arch.get_component_slice_mut::<Position>();
-            let rotations = arch.get_component_slice_mut::<Rotation>();
-
-            for update in updates {
+            for update in &updates {
                 positions[update.index].x = update.new_pos[0];
                 positions[update.index].y = update.new_pos[1];
                 positions[update.index].z = update.new_pos[2];
+            }
+        } // Отпускаем изменяемую ссылку на positions
+
+        {
+            let rotations = arch.get_component_slice_mut::<Rotation>();
+            for update in &updates {
                 rotations[update.index].x = update.new_rot[0];
                 rotations[update.index].y = update.new_rot[1];
                 rotations[update.index].z = update.new_rot[2];

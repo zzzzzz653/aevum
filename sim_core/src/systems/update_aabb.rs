@@ -48,9 +48,10 @@ pub fn update_aabb(world: &mut World) {
             } // Чтение завершено
 
             // Шаг 2: Применяем новые AABB
+            let entity_count = arch.len;
             {
                 let aabbs = arch.get_component_slice_mut::<AABB>();
-                for i in 0..arch.len {
+                for i in 0..entity_count {
                     aabbs[i] = new_aabbs[i];
                 }
             }

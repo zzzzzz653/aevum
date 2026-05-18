@@ -7,69 +7,13 @@
 *.so
 *.a
 *.out
-build/
-dist/
-target/
-
 # Dependencies
-**/node_modules/
-**/venv/
-**/env/
-**/.venv/
-**/__pycache__/
-**/.mypy_cache/
-**/.pytest_cache/
-**/.gradle/
-
-# Rust-specific
-Cargo.lock
 **/target/
-
+# Logs and temp files
+*.log
+*.tmp
+*.swp
 # Editors
 .vscode/
 .idea/
-*.swp
-*.swo
-*.tmp
-
-# Logs
-*.log
-
-# Coverage
-coverage/
-htmlcov/
-.coverage
-
-# Environment
-.env
-.env.local
-*.env.*
-
-# System
-.DS_Store
-Thumbs.db
-
-# Compressed files
-*.zip
-*.gz
-*.tar
-*.tgz
-*.bz2
-*.xz
-*.7z
-*.rar
-*.zst
-*.lz4
-*.lzh
-*.cab
-*.arj
-*.rpm
-*.deb
-*.Z
-*.lz
-*.lzo
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.tar.zst
 ```
