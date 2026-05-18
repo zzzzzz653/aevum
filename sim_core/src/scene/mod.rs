@@ -49,7 +49,9 @@ impl<'a> SceneSpawner<'a> {
     }
 
     /// Спавн множества сфер для теста производительности
-    pub fn spawn_sphere_grid(&mut self, count: usize, spacing: f32, radius: f32, mass: f32) {
+    pub fn spawn_sphere_grid(&mut self, count: usize, spacing: f32, start_x: f32, start_y: f32) {
+        let radius = start_x;  // используем start_x как радиус
+        let mass = start_y;    // используем start_y как массу
         let mut spawned = 0;
         let size = (count as f32).cbrt() as usize + 1;
         

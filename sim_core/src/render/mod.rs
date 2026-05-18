@@ -5,6 +5,7 @@ use crate::components::transform::Position;
 use crate::components::physics::CollisionShape;
 use glam::{Vec3, Mat4};
 use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
 
 /// Конфигурация рендерера
 pub struct RenderConfig {
@@ -332,7 +333,7 @@ impl<'a> Renderer<'a> {
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
-                sample_checking: None,
+                alpha_to_coverage_enabled: false,
             },
             multiview: None,
         });
@@ -365,39 +366,34 @@ impl<'a> Renderer<'a> {
         
         for arch in world.archetypes() {
             // Проверить, есть ли в архетипе Position и CollisionShape
-            if let (Some(positions), Some(shapes)) = (
-                arch.get_component_slice::<Position>(),
-                arch.get_component_slice::<CollisionShape>(),
-            ) {
-                for i in 0..arch.len {
-                    let pos = &positions[i];
-                    let shape = &shapes[i];
-                    
-                    // Создать матрицу модели (translation + scale)
-                    let radius = match shape {
-                        CollisionShape::Sphere(r) => *r,
-                        _ => 1.0,
-                    };
-                    
-                    let model = Mat4::from_scale_rotation_translation(
-                        Vec3::new(radius, radius, radius),
-                        glam::Quat::IDENTITY,
-                        Vec3::new(pos.x, pos.y, pos.z),
-                    );
-                    
-                    // Цвет на основе позиции (для визуального разнообразия)
-                    let color = [
-                        0.5 + 0.5 * ((pos.x * 0.1).sin()),
-                        0.5 + 0.5 * ((pos.y * 0.1).sin()),
-                        0.5 + 0.5 * ((pos.z * 0.1).sin()),
-                        1.0,
-                    ];
-                    
-                    instances.push(InstanceData {
-                        model: model.to_cols_array_2d(),
-                        color,
-                    });
-                }
+            let positions = arch.get_component_slice::<Position>();
+            let shapes = arch.get_component_slice::<CollisionShape>();
+            
+            for i in 0..arch.len {
+                let pos = &positions[i];
+                let shape = &shapes[i];
+                
+                // Создать матрицу модели (translation + scale)
+                let radius = shape.radius();
+                
+                let model = Mat4::from_scale_rotation_translation(
+                    Vec3::new(radius, radius, radius),
+                    glam::Quat::IDENTITY,
+                    Vec3::new(pos.x, pos.y, pos.z),
+                );
+                
+                // Цвет на основе позиции (для визуального разнообразия)
+                let color = [
+                    0.5 + 0.5 * ((pos.x * 0.1).sin()),
+                    0.5 + 0.5 * ((pos.y * 0.1).sin()),
+                    0.5 + 0.5 * ((pos.z * 0.1).sin()),
+                    1.0,
+                ];
+                
+                instances.push(InstanceData {
+                    model: model.to_cols_array_2d(),
+                    color,
+                });
             }
         }
         

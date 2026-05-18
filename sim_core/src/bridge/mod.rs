@@ -35,7 +35,7 @@ impl Simulation {
     /// Спавн сфер в сетке
     fn spawn_sphere_grid(&mut self, count: u32, spacing: f32, start_x: f32, start_y: f32) {
         let mut spawner = SceneSpawner::new(&mut self.world);
-        spawner.spawn_sphere_grid(count, spacing, start_x, start_y);
+        spawner.spawn_sphere_grid(count as usize, spacing, start_x, start_y);
     }
     
     /// Получить количество сущностей
